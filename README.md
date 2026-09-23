@@ -29,3 +29,5 @@ backend\.venv\Scripts\python.exe backend\export_all_full_models.py --check-only
 接口保留对象原字段 `label`、`score`、`bbox`、`mask`，只追加 `keypoints`。前端支持 COCO 17 点骨架显示/隐藏，坐标与框、掩码均以原图像素为准。
 
 部署细节、Arc 驱动校验、显存与坐标问题排查见 [backend/OPENVINO_DEPLOY.md](backend/OPENVINO_DEPLOY.md)。
+
+权重需自行下载，推荐魔搭社区，因为文件太大了，不好上传，开源模型权重全下载后，总项目大小会接近20GB
