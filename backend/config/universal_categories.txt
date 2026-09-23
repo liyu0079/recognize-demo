@@ -1,0 +1,98 @@
+helmet
+text
+vest
+license plate
+street lamp
+fire hydrant
+bench
+trash can
+mailbox
+skateboard
+surfboard
+tennis racket
+baseball bat
+basketball hoop
+backboard
+food
+pizza
+hamburger
+ sandwich
+cake
+donut
+carrot
+potato
+pepper
+corn
+egg
+plate
+fork
+knife
+spoon
+wine glass
+coffee mug
+can
+remote control
+speaker
+camera
+microphone
+printer
+refrigerator
+oven
+sink
+toilet
+bathtub
+mirror
+curtain
+cabinet
+counter
+backpack
+suitcase
+shoe
+hat
+glasses
+watch
+ring
+necklace
+stroller
+wheelchair
+animal
+deer
+lion
+tiger
+monkey
+rabbit
+insect
+butterfly
+bee
+fish
+boat
+airplane
+helicopter
+traffic sign
+crosswalk
+sidewalk
+parking lot
+railway
+mountain
+hill
+sky
+cloud
+lake
+river
+sea
+sand
+snow
+stone
+rock
+flower
+bush
+shrub
+warehouse
+school
+hospital
+apartment
+skyscraper
+construction site
+stadium
+church
+warehouse door
