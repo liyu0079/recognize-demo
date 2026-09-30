@@ -2,6 +2,12 @@
 
 后端在本机运行 Grounding DINO、SAM2-small、RTMPose-tiny。媒体和提示词只进入本地 FastAPI；运行期不会下载权重或调用外部服务。
 
+## 手部姿态与 Moondream2
+
+- `weights\rtmpose-hand-litert\rtmhand_fp16.tflite` 是官方 LiteRT 模型。当前 OpenVINO 2025 TFLite 前端无法转换该图，服务会自动用本地 `ai-edge-litert` 执行真实 21 点手部推理。`/api/health` 会明确显示 `engine: litert-local` 与 `openvino_ir: false`。
+- `weights\moondream2\model.safetensors` 是 Moondream2 的 PyTorch 快照，不是 OpenVINO GenAI IR。运行 `python export_all_full_models.py --moondream-only` 会调用本项目的专用 Stateful 导出器，不使用 Optimum。完整命令、精度验证和 Arc 排障见 [moondream_openvino/README.md](moondream_openvino/README.md)。导出失败时健康接口会如实显示 Caption 不可用，不会生成模板描述。
+- 只在拥有至少 12 GB 空闲系统内存的机器上设置 `$env:ENABLE_MOONDREAM_CPU_FALLBACK="1"` 使用本地 PyTorch CPU Caption；默认关闭，防止 1.7B 模型耗尽后端进程内存。OpenVINO IR 出现后会优先使用 Arc，不需要该开关。
+
 首次在可联网的准备机执行：
 
 ```powershell

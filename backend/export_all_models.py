@@ -55,35 +55,54 @@ def save_ir(model: object, example_input: object, name: str, output_names: tuple
     if not force and xml.exists() and xml.with_suffix(".bin").exists():
         print(f"[skip] {name}: {xml}")
         return
-    try:
-        print(f"[convert] {name}: OpenVINO PyTorch frontend", flush=True)
-        ov_model = ov.convert_model(model, example_input=example_input)
-    except Exception as direct_error:
-        print(f"[fallback] {name}: direct conversion failed: {direct_error}", flush=True)
-        onnx_path = IR_DIR / f"{name}.onnx"
-        if not onnx_path.exists():
-            export_kwargs = {"opset_version": 17, "do_constant_folding": True, "output_names": list(output_names)}
-            if isinstance(example_input, dict):
-                if name == "grounding_dino":
-                    # GroundingDino forward order is pixel_values, input_ids,
-                    # token_type_ids, attention_mask, pixel_mask. Exporting
-                    # kwargs assigns names by position and silently swaps ports.
-                    ordered_names = ("pixel_values", "input_ids", "token_type_ids", "attention_mask", "pixel_mask")
-                    ordered_inputs = tuple(example_input[key] for key in ordered_names)
-                    export_kwargs["input_names"] = list(ordered_names)
-                    torch.onnx.export(model, ordered_inputs, f=str(onnx_path), **export_kwargs)
-                else:
-                    export_kwargs["input_names"] = list(example_input)
-                    torch.onnx.export(model, args=(), kwargs=example_input, f=str(onnx_path), **export_kwargs)
-            else:
-                torch.onnx.export(model, example_input, str(onnx_path), **export_kwargs)
-            print(f"[onnx] {name}: {onnx_path}", flush=True)
+    onnx_path = IR_DIR / f"{name}.onnx"
+    # GroundingDINO 的 PyTorch 前端在部分 OpenVINO 版本会长时间卡在
+    # 图转换阶段。已有的固定 shape ONNX 带完整输入/输出端口，优先用它
+    # 重生成 IR；本地没有 ONNX 时仍保留下面的 PyTorch 前端兜底路径。
+    prefer_existing_onnx = name == "grounding_dino" and onnx_path.exists()
+    if prefer_existing_onnx:
+        print(f"[convert] {name}: existing local ONNX", flush=True)
         ov_model = ov.convert_model(str(onnx_path))
+    else:
+        try:
+            print(f"[convert] {name}: OpenVINO PyTorch frontend", flush=True)
+            ov_model = ov.convert_model(model, example_input=example_input)
+        except Exception as direct_error:
+            print(f"[fallback] {name}: direct conversion failed: {direct_error}", flush=True)
+
+            if not onnx_path.exists():
+                export_kwargs = {"opset_version": 17, "do_constant_folding": True, "output_names": list(output_names)}
+                if isinstance(example_input, dict):
+                    if name == "grounding_dino":
+                        # GroundingDino forward order is pixel_values, input_ids,
+                        # token_type_ids, attention_mask, pixel_mask. Exporting
+                        # kwargs assigns names by position and silently swaps ports.
+                        ordered_names = ("pixel_values", "input_ids", "token_type_ids", "attention_mask", "pixel_mask")
+                        ordered_inputs = tuple(example_input[key] for key in ordered_names)
+                        export_kwargs["input_names"] = list(ordered_names)
+                        torch.onnx.export(model, ordered_inputs, f=str(onnx_path), **export_kwargs)
+                    else:
+                        export_kwargs["input_names"] = list(example_input)
+                        torch.onnx.export(model, args=(), kwargs=example_input, f=str(onnx_path), **export_kwargs)
+                else:
+                    torch.onnx.export(model, example_input, str(onnx_path), **export_kwargs)
+                print(f"[onnx] {name}: {onnx_path}", flush=True)
+            ov_model = ov.convert_model(str(onnx_path))
     # OpenVINO 前端对部分 PyTorch 分支会保留动态维度。这里按导出样例
     # 固化所有输入，避免 Arc GPU 首次编译时出现动态 shape/显存抖动。
     shape_values: list[tuple[int, ...]] = []
     if isinstance(example_input, dict):
-        shape_values = [tuple(int(v) for v in value.shape) for value in example_input.values()]
+        # ONNX GroundingDINO 的输入顺序以 pixel_values 开始，而处理器返回
+        # 的字典以 input_ids 开始。必须按端口名绑定 shape，不能 zip 字典值。
+        reshape_by_port: dict[object, tuple[int, ...]] = {}
+        for port in ov_model.inputs:
+            port_name = port.get_any_name()
+            key = "input_ids" if port_name.isdigit() and "input_ids" in example_input else port_name
+            value = example_input.get(key)
+            if value is not None and hasattr(value, "shape"):
+                reshape_by_port[port] = tuple(int(v) for v in value.shape)
+        if reshape_by_port:
+            ov_model.reshape(reshape_by_port)
     elif isinstance(example_input, (tuple, list)):
         shape_values = [tuple(int(v) for v in value.shape) for value in example_input]
     elif hasattr(example_input, "shape"):

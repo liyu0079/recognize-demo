@@ -64,11 +64,23 @@ ARTIFACTS: tuple[ModelArtifact, ...] = (
 )
 
 
-def md5_file(path: Path) -> str:
+def md5_file(path: Path, *, progress_label: str = "") -> str:
+    """Calculate MD5 and print a heartbeat for multi-gigabyte files."""
     digest = hashlib.md5()
+    total = path.stat().st_size
+    processed = 0
+    next_report = 256 * 1024 * 1024
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+            processed += len(chunk)
+            if progress_label and total >= next_report and processed >= next_report:
+                print(
+                    f"[audit] {progress_label}: {processed / 1024 / 1024:.0f}/"
+                    f"{total / 1024 / 1024:.0f} MiB",
+                    flush=True,
+                )
+                next_report += 256 * 1024 * 1024
     return digest.hexdigest()
 
 
@@ -81,13 +93,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def md5_directory(path: Path) -> str:
+def md5_directory(path: Path, *, progress_label: str = "") -> str:
     digest = hashlib.md5()
     for item in sorted(x for x in path.rglob("*") if x.is_file()):
         if ".git" in item.relative_to(path).parts or item.name == ".modelscope_complete":
             continue
         digest.update(str(item.relative_to(path)).replace("\\", "/").encode())
-        digest.update(md5_file(item).encode())
+        digest.update(md5_file(item, progress_label=f"{progress_label}/{item.name}").encode())
     return digest.hexdigest()
 
 
@@ -338,7 +350,8 @@ def audit_models(auto_download: bool = False) -> dict[str, dict[str, Any]]:
             reason = "本地模型快照不存在" if not _has_model_files(target) else "缺少关键模型文件: " + ", ".join(missing_required)
             report[artifact.name] = {"available": False, "checksum": "missing", "missing_files": missing_required, "path": str(target), "source": artifact.repository, "repository": artifact.model_id, "model_id": artifact.configured_model_id, "cache_dir": str(MODELSCOPE_CACHE_DIR), "expected_md5": _environment_md5(artifact.name, artifact.md5), "error": error or reason}
             continue
-        actual = md5_directory(target)
+        print(f"[audit] {artifact.name}: checking {target}", flush=True)
+        actual = md5_directory(target, progress_label=artifact.name)
         expected = _environment_md5(artifact.name, artifact.md5)
         if expected:
             valid, checksum, error = actual == expected, ("verified" if actual == expected else "failed"), ("MD5 不匹配" if actual != expected else "")

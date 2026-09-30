@@ -1,0 +1,9 @@
+# Dedicated exporter dependencies. Install in the same Python environment as the backend.
+torch>=2.2,<2.7
+openvino>=2024.3,<2026.0
+openvino-genai>=2024.3,<2026.0
+safetensors>=0.5.0
+tokenizers>=0.20.0
+numpy>=1.26,<2.0
+pillow>=10.0
+opencv-python>=4.9

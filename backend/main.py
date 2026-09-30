@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import math
 import os
 import re
 import tempfile
@@ -29,30 +30,43 @@ from full_capabilities import FullCapabilityEnricher
 
 # ======================== 可配置参数 ========================
 USE_OPENVINO = os.getenv("USE_OPENVINO", "1") not in {"0", "false", "False"}
-BOX_CONFIDENCE_THRESHOLD = float(os.getenv("BOX_CONFIDENCE_THRESHOLD", "0.3"))
-TEXT_CONFIDENCE_THRESHOLD = 0.25
+BOX_CONFIDENCE_THRESHOLD = float(os.getenv("BOX_CONFIDENCE_THRESHOLD", "0.25"))
+TEXT_CONFIDENCE_THRESHOLD = float(os.getenv("TEXT_CONFIDENCE_THRESHOLD", "0.22"))
 MAX_IMAGE_LONG_EDGE = int(os.getenv("MAX_IMAGE_LONG_EDGE", "1280"))
 OPENVINO_IDLE_SECONDS = int(os.getenv("OPENVINO_IDLE_SECONDS", "90"))
 VIDEO_SAMPLE_INTERVAL_SECONDS = 3.0  # 视频每隔约 3 秒取一个关键帧
 VIDEO_MIN_SAMPLE_COUNT = 4
 VIDEO_MAX_SAMPLE_COUNT = 18
-MAX_OBJECTS_PER_FRAME = 80
-MAX_RESPONSE_OBJECTS = int(os.getenv("MAX_RESPONSE_OBJECTS", "60"))
+MAX_OBJECTS_PER_FRAME = int(os.getenv("MAX_OBJECTS_PER_FRAME", "100"))
+# 检测框和 SAM2 掩码是两种不同成本。所有通过 NMS 的真实检测都会返回，
+# 只有最高分的一部分进入分割，避免街景等场景因几十个框进入分钟级等待。
+MAX_RESPONSE_OBJECTS = int(os.getenv("MAX_RESPONSE_OBJECTS", "80"))
+# SAM2 CPU 兜底同样逐框/批量计算；限制分割实例数避免多目标图片进入分钟级。
+MAX_SEGMENTED_OBJECTS = max(1, int(os.getenv("MAX_SEGMENTED_OBJECTS", "24")))
+# GroundingDINO 文本编码器最多 256 token。每组保持短小、按常见场景拆分，
+# 默认跑完四组经过场景审计的核心类别。部署者可显式设为 5+，再加入
+# universal_categories.txt 的扩展组；这样不会让旧词表中的服饰等噪声拖慢默认检测。
+MAX_UNIVERSAL_PROMPT_GROUPS = max(1, int(os.getenv("MAX_UNIVERSAL_PROMPT_GROUPS", "4")))
 MAX_POSE_PERSONS = int(os.getenv("MAX_POSE_PERSONS", "12"))
 
 # 无需提示模式使用本地 Grounding DINO 的常见主体类别词表。Grounding DINO 本身需要
 # 文本输入，因此这不是云端“万物模型”，而是可审计、可按业务扩充的本地候选集合。
 BASE_UNIVERSAL_PROMPT_GROUPS = (
-    "person. child. man. woman. face. head. hand. arm. leg. clothing. shirt. shorts. shoe. sneaker. backpack. handbag. umbrella",
-    "soccer ball. football. sports ball. ball. goal. goalpost. tomato. apple. orange. banana. fruit. bottle. cup. bowl",
-    "car. truck. bus. van. motorcycle. bicycle. train. traffic light. stop sign. dog. cat. bird. horse. cow. sheep",
-    "chair. table. sofa. bed. television. monitor. laptop. cell phone. keyboard. mouse. book. clock. door. window. pole. tree. plant. leaf. grass. road. fence. building. house. bridge. sign. text. tower. wall",
+    # 不把 head/face/arm 等人体局部与完整人物混在无提示词表中，减少重复框。
+    "person. child. man. woman. pedestrian. cyclist. dog. cat. bird. horse. cow. sheep. backpack. handbag. umbrella. helmet",
+    # 明确加入道路车辆、井盖和道路设施；不含 goal/head 等容易诱发错类的词。
+    "car. sedan. automobile. vehicle. truck. pickup truck. SUV. van. bus. motorcycle. bicycle. train. boat. airplane. tire. wheel. road. dirt road. sidewalk. crosswalk. parking lot. manhole cover. guardrail. traffic light. traffic sign. street lamp. fire hydrant. trolley. shopping cart. trash can. bin",
+    # 番茄植株、常见果蔬及建筑环境独立成组，避免车辆词表挤占 token 预算。
+    "tomato. tomatoes. ripe tomato. red tomato. tomato fruit. tomato plant. tomato vine. cluster of tomatoes. apple. orange. banana. lemon. fruit. plant. tree. leaf. grass. flower. bush. shrub. field. desert. sand. mountain. hill. fence. building. house. bridge. sign. billboard. storefront. warehouse. school. hospital. apartment",
+    # 家居、电器及常见物品；把空调外机作为独立概念明确提示。
+    "air conditioner. outdoor air conditioner. AC outdoor unit. HVAC unit. chair. table. sofa. bed. refrigerator. oven. sink. toilet. bathtub. television. monitor. laptop. cell phone. keyboard. mouse. book. clock. door. window. cabinet. counter. bottle. cup. bowl. plate. shoe",
 )
 
-# 视频优先覆盖主要运动主体，减少每帧文本编码和检测次数；场景类仍保留道路、植被等主体。
+# 视频优先车辆和地表/道路，人体与动物放第三组；OCR 独立识别，不把 text 当物体候选。
 VIDEO_UNIVERSAL_PROMPT_GROUPS = (
-    "person. child. face. head. hand. arm. leg. clothing. shirt. shorts. shoe. sneaker. soccer ball. football. sports ball. car. truck. bus. van. motorcycle. bicycle. tomato. fruit",
-    "dog. cat. bird. tree. plant. leaf. grass. road. fence. goal. goalpost. building. sign",
+    "car. sedan. automobile. vehicle. truck. pickup truck. SUV. van. bus. motorcycle. bicycle. off-road vehicle. convoy of vehicles. wheel. tire. road. dirt road. rural road. tire tracks. guardrail. bridge. manhole cover",
+    "desert. field. sand. mountain. hill. grass. tree. plant. bush. shrub. road sign. street lamp. building. house. fence. road. sky. cloud",
+    "person. pedestrian. cyclist. dog. cat. horse. sheep. cow. backpack. umbrella",
 )
 
 TEXT_ALIASES = {
@@ -65,7 +79,11 @@ TEXT_ALIASES = {
 LABEL_ALIASES = {
     "football": "soccer ball", "soccer ball": "soccer ball", "sports ball": "sports ball",
     "ball": "sports ball", "vehicle": "car", "automobile": "car", "motor vehicle": "car",
-    "goalpost": "goal", "goal post": "goal", "fruit": "fruit",
+    "sedan": "car", "off-road vehicle": "car", "tomato plant": "tomato plant",
+    "tomatoes": "tomato", "ripe tomato": "tomato", "red tomato": "tomato", "tomato fruit": "tomato",
+    "tomato vine": "tomato plant", "air conditioner outdoor unit": "air conditioner",
+    "outdoor air conditioner": "air conditioner", "ac outdoor unit": "air conditioner", "hvac unit": "air conditioner",
+    "fruit": "fruit",
 }
 
 # 父类与子类关系用于“具体类别优先”过滤。这里只影响重叠框，不会阻止子类候选参与检测。
@@ -118,6 +136,7 @@ SAM2_REPO_ID, SAM2_CHECKPOINT_FILENAME, SAM2_CONFIG_NAME = SAM2_VARIANTS[SAM2_VA
 
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.getenv("MODEL_DIR", str(BASE_DIR / "models"))).resolve()
+WEIGHTS_DIR = Path(os.getenv("MODEL_WEIGHTS_DIR", str(BASE_DIR.parent / "weights"))).resolve()
 GROUNDING_DINO_DIR = Path(os.getenv("GROUNDING_DINO_MODEL_DIR", str(MODEL_DIR / GROUNDING_DINO_REPO_ID.rsplit("/", 1)[-1]))).resolve()
 SAM2_DIR = MODEL_DIR / f"sam2.1-hiera-{SAM2_VARIANT}"
 GROUNDING_DINO_REQUIRED_FILES = (
@@ -159,7 +178,12 @@ def _category_tokens(values: Any) -> list[str]:
         if not isinstance(value, str):
             continue
         value = re.sub(r"\s+", " ", value.strip().lower().strip("."))
-        blocked = {"food", "animal", "plant", "vegetation", "fruit", "building", "vehicle", "object", "thing", "item", "stuff", "equipment", "device"}
+        blocked = {
+            "food", "animal", "plant", "vegetation", "fruit", "building", "vehicle", "object", "thing", "item", "stuff", "equipment", "device",
+            # OCR 单独负责 text；这些人体局部/运动场地概念在开放候选词表里
+            # 容易把整个人或无关背景切成碎片。需要时仍可用显式文本提示检测。
+            "text", "head", "face", "arm", "arms", "leg", "legs", "shorts", "goal", "goalpost", "goal post", "vest", "clothing",
+        }
         if value and value not in blocked and re.fullmatch(r"[a-z0-9][a-z0-9 _-]{0,59}", value) and value not in result:
             result.append(value)
     return result[:MAX_UNIVERSAL_CATEGORIES]
@@ -185,8 +209,9 @@ def load_universal_categories() -> tuple[str, ...]:
     merged = list(dict.fromkeys(categories))
     if not merged:
         return BASE_UNIVERSAL_PROMPT_GROUPS
-    # 外部类别作为一个独立分组，保留内置分组的稳定召回。
-    chunks = [". ".join(merged[index : index + 64]) for index in range(0, len(merged), 64)]
+    # GroundingDINO 的文本编码器最多接受 256 token。按约 40 个短类别切组，
+    # 让每组都完整参与匹配，不依赖处理器悄悄截断词表后半段。
+    chunks = [". ".join(merged[index : index + 40]) for index in range(0, len(merged), 40)]
     return BASE_UNIVERSAL_PROMPT_GROUPS + tuple(chunks)
 
 
@@ -212,7 +237,7 @@ class DetectedObject(BaseModel):
 
 
 def local_capabilities() -> dict[str, dict[str, Any]]:
-    """Report only capabilities backed by files actually present on disk."""
+    """Report the real runtime for each capability, not just XML file presence."""
     ir_dir = MODEL_DIR / "openvino"
     files = {
         "grounding_dino": ir_dir / "grounding_dino.xml",
@@ -220,9 +245,27 @@ def local_capabilities() -> dict[str, dict[str, Any]]:
         "rtmpose_tiny": ir_dir / "rtmpose_tiny.xml",
         "rtmpose_hand": ir_dir / "rtmpose_hand.xml",
         "paddleocr": ir_dir / "paddleocr.xml",
-        "moondream2": ir_dir / "moondream2.xml",
+        # Dedicated Moondream2 exporter is a multi-file Stateful bundle.
+        "moondream2": ir_dir / "moondream2" / "decoder.xml",
     }
-    return {name: {"available": path.exists() and path.with_suffix('.bin').exists(), "path": str(path)} for name, path in files.items()}
+    capabilities = {
+        name: {"available": path.exists() and path.with_suffix('.bin').exists(), "path": str(path), "engine": "openvino", "openvino_ir": path.exists() and path.with_suffix('.bin').exists()}
+        for name, path in files.items()
+    }
+    hand_tflite = WEIGHTS_DIR / "rtmpose-hand-litert" / "rtmhand_fp16.tflite"
+    if not capabilities["rtmpose_hand"]["available"] and hand_tflite.is_file():
+        capabilities["rtmpose_hand"] = {"available": True, "path": str(hand_tflite), "engine": "litert-local", "openvino_ir": False}
+    moondream_weights = WEIGHTS_DIR / "moondream2" / "model.safetensors"
+    if not capabilities["moondream2"]["available"] and moondream_weights.is_file():
+        capabilities["moondream2"] = {
+            "available": False,
+            "asset_present": True,
+            "path": str(moondream_weights),
+            "engine": "pytorch-cpu",
+            "openvino_ir": False,
+            "error": "本地 safetensors 完整，但 Moondream2 OpenVINO IR 尚未导出；详见 enrichment.caption",
+        }
+    return capabilities
 
 
 def encode_mask_rle(mask: list[list[int]] | np.ndarray) -> tuple[str, list[int]]:
@@ -247,35 +290,78 @@ def encode_mask_rle(mask: list[list[int]] | np.ndarray) -> tuple[str, list[int]]
 
 
 def object_description(label: str, bbox: list[float], image_width: int, image_height: int) -> str:
-    """Describe only measured detection data; this is not a generated scene caption."""
+    """给出简洁位置与类别描述；不把框面积伪装成语义说明。"""
     x1, y1, x2, y2 = bbox
     center_x = (x1 + x2) / 2
     center_y = (y1 + y2) / 2
     horizontal = "左侧" if center_x < image_width / 3 else "右侧" if center_x > image_width * 2 / 3 else "中部"
     vertical = "上方" if center_y < image_height / 3 else "下方" if center_y > image_height * 2 / 3 else "中部"
-    coverage = max(0.0, (x2 - x1) * (y2 - y1) / max(1, image_width * image_height) * 100)
     location = horizontal if horizontal == "中部" else f"{horizontal}{vertical}"
     if label.lower() == "text":
-        return f"画面{location}的文本区域，约占画面 {coverage:.1f}%"
-    return f"画面{location}的 {label}，约占画面 {coverage:.1f}%"
+        return f"画面{location}的文字区域"
+    return f"画面{location}的{label}"
 
 
-def compact_object(item: DetectedObject) -> DetectedObject:
+def _finite_number(value: Any) -> float | None:
+    """将 numpy/Python 数值转换为 JSON 可用的有限浮点数。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _compact_keypoints(points: Any) -> list[dict[str, float]]:
+    """只保留模型实际返回且坐标、置信度均为有限值的关键点。"""
+    cleaned: list[dict[str, float]] = []
+    for point in points if isinstance(points, list) else []:
+        if not isinstance(point, dict):
+            continue
+        x, y, score = (_finite_number(point.get(key)) for key in ("x", "y", "score"))
+        if x is None or y is None or score is None:
+            continue
+        cleaned.append({"x": round(x, 2), "y": round(y, 2), "score": round(score, 4)})
+    return cleaned
+
+
+def compact_object(item: DetectedObject) -> DetectedObject | None:
+    """压缩掩码并拦截模型输出中的 NaN/Infinity。
+
+    OpenVINO 异常输出不能被 JSON 编码。检测框或置信度异常时该实例没有
+    可用的真实标注信息，因此丢弃该实例而不是用伪造数值替代。
+    """
+    bbox = [_finite_number(value) for value in item.bbox]
+    score = _finite_number(item.score)
+    if len(bbox) != 4 or any(value is None for value in bbox) or score is None:
+        logger.warning("跳过包含非有限坐标或置信度的检测实例：%s", item.label)
+        return None
     raw_mask = item.mask if isinstance(item.mask, list) else []
-    mask_rle, mask_size = encode_mask_rle(raw_mask)
+    try:
+        mask_rle, mask_size = encode_mask_rle(raw_mask)
+    except (TypeError, ValueError):
+        # 掩码异常不影响仍然有效的真实 bbox 检测结果。
+        mask_rle, mask_size = "", []
+        logger.warning("检测实例 %s 的掩码格式异常，已省略掩码。", item.label)
+    hand_keypoints = [_compact_keypoints(hand) for hand in item.hand_keypoints if isinstance(hand, list)]
+    hand_keypoints = [hand for hand in hand_keypoints if hand]
     return DetectedObject(
-        label=item.label,
-        score=item.score,
-        bbox=item.bbox,
+        label=str(item.label),
+        score=round(score, 4),
+        bbox=[round(value, 2) for value in bbox if value is not None],
         mask=mask_rle,
         mask_rle=mask_rle,
         mask_size=mask_size,
-        keypoints=item.keypoints,
-        hand_keypoints=item.hand_keypoints,
-        ocr_text=item.ocr_text,
-        description=item.description,
-        caption=item.caption,
+        keypoints=_compact_keypoints(item.keypoints),
+        hand_keypoints=hand_keypoints,
+        ocr_text=str(item.ocr_text or ""),
+        description=str(item.description or ""),
+        caption=str(item.caption or ""),
     )
+
+
+def compact_objects(items: list[DetectedObject]) -> list[DetectedObject]:
+    """批量压缩并过滤无法安全序列化的模型实例。"""
+    return [result for item in items if (result := compact_object(item)) is not None]
 
 
 class VideoFrameAnnotation(BaseModel):
@@ -435,7 +521,17 @@ class PyTorchModelManager:
             batch_scores: list[np.ndarray] = []
             labels: list[str] = []
             for normalized_prompt in prompts:
-                inputs = self.processor(images=pil_image, text=normalized_prompt, return_tensors="pt")
+                # GroundingDINO 的文本编码器固定支持最多 256 个 token。
+                # 长类别列表必须截断到模型上限，否则会在 forward 阶段触发
+                # ``size of tensor ... must match ... 256`` 并让整次分析返回 500。
+                inputs = self.processor(
+                    images=pil_image,
+                    text=normalized_prompt,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=256,
+                    return_tensors="pt",
+                )
                 inputs = {key: value.to(self.device) for key, value in inputs.items()}
                 outputs = self.detector(**inputs)
                 processed = post_process(
@@ -459,39 +555,65 @@ class PyTorchModelManager:
             keep_indexes = class_aware_nms(boxes, scores, labels, MAX_OBJECTS_PER_FRAME, iou_threshold=0.45)
             keep_indexes = suppress_generic_overlaps(boxes, scores, labels, keep_indexes)
             keep_indexes = suppress_sibling_overlaps(boxes, scores, labels, keep_indexes)
-            keep_indexes = suppress_contextual_fruit_errors(labels, keep_indexes)
+            keep_indexes = suppress_contextual_fruit_errors(boxes, labels, keep_indexes)
             if strict_glasses:
                 keep_indexes = require_visible_glasses(boxes, labels, keep_indexes)
             if color_hint:
                 keep_indexes = filter_boxes_by_color(resized_rgb, boxes, keep_indexes, color_hint)
-            boxes = boxes[keep_indexes]
-            scores = scores[keep_indexes]
-            labels = [labels[index] for index in keep_indexes]
+            keep_indexes = sorted(keep_indexes, key=lambda index: float(scores[index]), reverse=True)[:MAX_RESPONSE_OBJECTS]
+            segment_indexes = keep_indexes[:MAX_SEGMENTED_OBJECTS]
+            if len(keep_indexes) > MAX_SEGMENTED_OBJECTS:
+                logger.info(
+                    "CPU 兜底返回 %d 个检测实例，其中得分最高的 %d 个执行 SAM2 分割。",
+                    len(keep_indexes),
+                    MAX_SEGMENTED_OBJECTS,
+                )
+            selected_boxes = boxes[keep_indexes]
+            selected_scores = scores[keep_indexes]
+            selected_labels = [labels[index] for index in keep_indexes]
+            segment_positions = {source: position for position, source in enumerate(segment_indexes)}
+            segment_boxes = boxes[segment_indexes]
 
-            boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, resized_rgb.shape[1] - 1)
-            boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, resized_rgb.shape[0] - 1)
+            selected_boxes[:, [0, 2]] = np.clip(selected_boxes[:, [0, 2]], 0, resized_rgb.shape[1] - 1)
+            selected_boxes[:, [1, 3]] = np.clip(selected_boxes[:, [1, 3]], 0, resized_rgb.shape[0] - 1)
+            segment_boxes[:, [0, 2]] = np.clip(segment_boxes[:, [0, 2]], 0, resized_rgb.shape[1] - 1)
+            segment_boxes[:, [1, 3]] = np.clip(segment_boxes[:, [1, 3]], 0, resized_rgb.shape[0] - 1)
 
-            logger.info("Grounding DINO 检测到 %d 个目标，开始批量执行 SAM2 分割。", len(boxes))
+            logger.info("Grounding DINO 检测到 %d 个目标，开始为 %d 个高分目标执行 SAM2 分割。", len(selected_boxes), len(segment_boxes))
             self.sam_predictor.set_image(resized_rgb)
-            masks, _, _ = self.sam_predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=boxes,
-                multimask_output=False,
-            )
+            # 当前 SAM2 checkpoint 在大批量 box decoder 时可能出现 batch
+            # 维度断言。按 8 框分批，失败时只放弃掩码，不丢弃真实检测框。
+            mask_batches: list[np.ndarray] = []
+            try:
+                for start in range(0, len(segment_boxes), 8):
+                    batch = segment_boxes[start : start + 8]
+                    batch_masks, _, _ = self.sam_predictor.predict(
+                        point_coords=None,
+                        point_labels=None,
+                        box=batch,
+                        multimask_output=False,
+                    )
+                    mask_batches.append(np.asarray(batch_masks))
+                masks = np.concatenate(mask_batches, axis=0) if mask_batches else np.empty((0, 0, 0), dtype=np.uint8)
+            except Exception as exc:
+                logger.warning("SAM2 分批分割失败，将保留检测框并省略掩码：%s", exc)
+                masks = np.empty((0, 0, 0), dtype=np.uint8)
 
-        masks = normalize_sam_masks(np.asarray(masks), len(boxes))
+        masks = normalize_sam_masks(np.asarray(masks), len(segment_boxes))
         original_height, original_width = image_rgb.shape[:2]
         detected: list[DetectedObject] = []
 
-        for index, (box, score, mask) in enumerate(zip(boxes, scores, masks)):
-            if mask.shape != (original_height, original_width):
+        for index, (box, score, label) in enumerate(zip(selected_boxes, selected_scores, selected_labels)):
+            source_index = keep_indexes[index]
+            mask_position = segment_positions.get(source_index)
+            mask = masks[mask_position] if mask_position is not None else None
+            if mask is not None and mask.shape != (original_height, original_width):
                 mask = cv2.resize(
                     mask.astype(np.uint8),
                     (original_width, original_height),
                     interpolation=cv2.INTER_NEAREST,
                 )
-            binary_mask = (mask > 0).astype(np.uint8)
+            binary_mask = (mask > 0).astype(np.uint8) if mask is not None else None
             original_box = [
                 float(box[0] / scale_x),
                 float(box[1] / scale_y),
@@ -502,17 +624,17 @@ class PyTorchModelManager:
             original_box[2] = max(0.0, min(original_box[2], original_width - 1.0))
             original_box[1] = max(0.0, min(original_box[1], original_height - 1.0))
             original_box[3] = max(0.0, min(original_box[3], original_height - 1.0))
-            label = referring_label or (labels[index] if index < len(labels) else "object")
             detected.append(
                 DetectedObject(
-                    label=label,
+                    label=referring_label or label,
                     score=round(float(score), 4),
                     bbox=[round(value, 2) for value in original_box],
-                    mask=binary_mask.tolist(),
+                    # 空掩码明确表示该低优先级实例未进入分割批次，不伪造分割结果。
+                    mask=binary_mask.tolist() if binary_mask is not None else "",
                 )
             )
 
-        logger.info("SAM2 分割完成，共返回 %d 个实例。", len(detected))
+        logger.info("SAM2 分割完成，返回 %d 个检测实例，其中 %d 个带真实掩码。", len(detected), len(segment_boxes))
         return detected
 
 
@@ -522,9 +644,10 @@ def canonicalize_label(label: str) -> str:
     # Grounding DINO 在一条长提示里偶尔会返回 "person child" 这类复合文本。
     # 无需提示工作台只展示主体类别，因此归一为最稳定的单一主类。
     subjects = (
-        "soccer ball", "football", "sports ball", "ball", "car", "truck", "bus", "van",
+        "outdoor air conditioner", "air conditioner", "ac outdoor unit", "hvac unit", "manhole cover", "traffic sign", "street lamp",
+        "tomato plant", "tomato vine", "tomato", "soccer ball", "football", "sports ball", "ball", "car", "truck", "bus", "van",
         "motorcycle", "bicycle", "person", "child", "woman", "man", "dog", "cat", "bird",
-        "horse", "cow", "sheep", "goalpost", "goal", "tree", "plant", "grass", "road", "fence",
+        "horse", "cow", "sheep", "tree", "plant", "grass", "road", "fence",
         "chair", "table", "sofa", "bed", "television", "monitor", "laptop", "cell phone",
         "keyboard", "mouse", "book", "clock", "bottle", "cup", "bowl", "glasses", "eyeglasses", "tomato", "apple", "orange", "text",
         "banana", "fruit", "door", "window", "pole", "building", "house", "bridge", "sign", "tower", "wall",
@@ -583,9 +706,25 @@ def filter_boxes_by_color(
             candidates.append((index, coverage))
     if not candidates:
         return []
-    # 颜色指代是排序约束：只保留颜色覆盖最强的候选，避免“紫色衣服”命中全部人物。
+    # 颜色指代是证据约束，不是“只取最红的一框”。同一场景可能有多个
+    # 颜色相近的目标（例如七个西红柿），按最高覆盖率截断会直接丢实例。
     best_coverage = max(coverage for _, coverage in candidates)
-    return [index for index, coverage in candidates if coverage >= max(0.065, best_coverage * 0.84)]
+    minimum = max(0.035, best_coverage * 0.38)
+    return [index for index, coverage in candidates if coverage >= minimum]
+
+
+def referring_subject_recall(prompt: str) -> str | None:
+    """从已翻译的指代短语提取主体词，供第二次同类实例召回。"""
+    subjects = (
+        "soccer ball", "tomato", "person", "child", "woman", "man", "dog", "cat",
+        "bird", "car", "truck", "bus", "motorcycle", "bicycle", "cup", "bottle",
+        "laptop", "monitor", "cell phone", "table", "chair", "apple", "banana", "book",
+    )
+    normalized = prompt.lower()
+    for subject in subjects:
+        if re.search(rf"\b{re.escape(subject)}\b", normalized):
+            return subject
+    return None
 
 
 def normalize_text_prompt(prompt: str) -> str:
@@ -656,55 +795,84 @@ def prepare_prompt(
     return model_prompt + ".", raw
 
 
+VIDEO_TEXT_LABELS = {"text", "sign text", "license plate"}
+VEHICLE_LABELS = {"car", "truck", "pickup truck", "suv", "van", "bus", "motorcycle", "bicycle", "off-road vehicle"}
+PERSON_LABELS = {"person", "child", "man", "woman", "pedestrian", "cyclist"}
+OUTDOOR_LABELS = {"desert", "field", "sand", "mountain", "hill", "grass", "dirt road", "road", "shrub", "tree"}
+
+
+def _content_objects(objects: list[DetectedObject]) -> list[DetectedObject]:
+    """OCR 框不是场景主体；摘要与人数统计只用真实物体检测实例。"""
+    return [item for item in objects if item.label.lower().strip() not in VIDEO_TEXT_LABELS]
+
+
+def _representative_video_objects(frames: list[VideoFrameAnnotation]) -> list[DetectedObject]:
+    """按单帧选择视频主体，禁止把同一人在多个抽样帧中重复累计。"""
+    best: list[DetectedObject] = []
+    best_rank = -1.0
+    for frame in frames:
+        entities = _content_objects(frame.objects)
+        labels = [item.label.lower().strip() for item in entities]
+        vehicles = sum(label in VEHICLE_LABELS for label in labels)
+        people = sum(label in PERSON_LABELS for label in labels)
+        context = sum(label in OUTDOOR_LABELS for label in labels)
+        # 只要某帧检测到车辆，车辆数量就是首要排序键；避免其他帧重复出现
+        # 的行人数量压过“多车荒野道路”这类实际主体场景。
+        rank = vehicles * 100.0 + context * 2.0 + min(people, 3) * 0.1
+        if rank > best_rank:
+            best, best_rank = entities, rank
+    return best
+
+
 def infer_activity(objects: list[DetectedObject], media_type: str) -> str:
-    labels = [item.label.lower() for item in objects]
-    person_count = sum(label in {"person", "child", "man", "woman"} for label in labels)
+    entities = _content_objects(objects)
+    labels = [item.label.lower().strip() for item in entities]
+    person_count = sum(label in PERSON_LABELS for label in labels)
+    vehicle_count = sum(label in VEHICLE_LABELS for label in labels)
     ball_count = sum("ball" in label for label in labels)
-    car_count = sum(label in {"car", "truck", "bus", "van", "motorcycle", "bicycle"} for label in labels)
+    road_context = any(label in {"road", "dirt road", "sidewalk", "parking lot"} for label in labels)
+    wilderness = any(label in {"desert", "field", "sand", "mountain", "hill", "grass"} for label in labels)
+    if media_type == "video" and vehicle_count >= 2:
+        setting = "荒野道路" if wilderness else "道路" if road_context else "画面场景"
+        return f"视频关键帧中可见 {vehicle_count} 辆车辆，主体是车辆在{setting}上的行驶场景。"
     if ball_count and person_count >= 2:
-        return "画面显示多名人员在球场进行踢足球活动。"
-    if media_type == "video" and car_count >= 2:
-        return "视频中检测到多辆车辆沿道路前后行驶，呈现车队行驶场景。"
-    if person_count >= 2 and media_type == "video":
-        return "视频中检测到多名人员，画面包含连续的人物活动。"
-    if car_count:
-        return "画面中检测到车辆及其道路场景。"
+        return "画面中检测到多人和球类目标，呈现球场活动场景。"
+    if media_type == "video" and person_count:
+        return f"视频关键帧中可见约 {person_count} 名人物；人数按单帧估计，不跨帧重复累计。"
+    if person_count and road_context:
+        return "画面中检测到人物与道路场景；单张图片无法可靠确认行走等动态行为。"
+    if vehicle_count:
+        return "画面中检测到车辆及其周边道路/环境。"
     if person_count:
-        return "画面中检测到人物主体。"
-    return "已根据当前提示完成主体检测，未生成可确认的行为描述。"
+        return "画面中检测到人物主体；静态图片不足以确认具体动作。"
+    return "当前检测结果没有足够的时序或动作证据，暂不能确认具体行为。"
 
 
 def describe_content(objects: list[DetectedObject], media_type: str) -> str:
-    """只使用有检测依据的类别生成简短内容概括，避免把模型猜测写成确定事实。"""
-    labels = [item.label.lower() for item in objects]
-    person_count = sum(label in {"person", "child", "man", "woman"} for label in labels)
-    ball_count = sum("ball" in label for label in labels)
-    car_count = sum(label in {"car", "truck", "bus", "van", "motorcycle", "bicycle"} for label in labels)
-    tomato_count = sum(label == "tomato" for label in labels)
-    plant_context = any(label in {"tree", "plant", "leaf", "grass", "bush", "shrub"} for label in labels)
-    screen_count = sum(label in {"monitor", "television", "screen"} for label in labels)
-    if tomato_count >= 2 and plant_context:
-        return f"画面中是一棵番茄植株，枝叶间可见约 {tomato_count} 个番茄。"
-    if ball_count and person_count:
-        return f"画面中有 {person_count} 名人员在球场进行踢足球活动。"
-    if person_count >= 2 and screen_count:
-        return f"画面中有 {person_count} 个人，场景位于办公区域，可见显示器等设备。"
-    if media_type == "video" and car_count >= 2:
-        return "视频中可见多辆车辆沿道路连续行驶。"
-    if car_count:
-        return f"画面中可见 {car_count} 辆车辆及周围道路场景。"
+    """按单帧主要实体概括内容，不把 OCR 文本或框面积误当作场景语义。"""
+    entities = _content_objects(objects)
+    labels = [item.label.lower().strip() for item in entities]
+    vehicle_count = sum(label in VEHICLE_LABELS for label in labels)
+    person_count = sum(label in PERSON_LABELS for label in labels)
+    tomato_count = sum(label in {"tomato", "tomato plant"} for label in labels)
+    plant_context = any(label in {"tree", "plant", "leaf", "grass", "bush", "shrub", "tomato plant"} for label in labels)
+    road_context = any(label in {"road", "dirt road", "sidewalk", "parking lot"} for label in labels)
+    wilderness = any(label in {"desert", "field", "sand", "mountain", "hill", "grass", "shrub"} for label in labels)
+    if vehicle_count >= 2:
+        if media_type == "video":
+            setting = "荒野道路环境" if wilderness else "道路环境" if road_context else "场景中"
+            return f"视频关键帧可见 {vehicle_count} 辆车辆，主要内容是{setting}中的车辆行驶。"
+        return f"画面中可见 {vehicle_count} 辆车辆及其周边环境。"
+    if tomato_count and plant_context:
+        return f"画面中可见西红柿植株和 {tomato_count} 个西红柿。"
+    if vehicle_count:
+        return "画面中可见车辆及其周边环境。"
     if person_count:
-        return f"画面中可见 {person_count} 个人。"
+        return f"画面中可见 {person_count} 名人物。"
     if labels:
-        names = {
-            "monitor": "显示器", "television": "显示器", "person": "人员", "child": "儿童",
-            "tree": "树木", "plant": "植物", "tomato": "番茄", "soccer ball": "足球",
-            "car": "车辆", "truck": "卡车", "road": "道路", "building": "建筑",
-            "shoe": "鞋子", "sneaker": "运动鞋", "shirt": "上衣", "face": "脸部",
-        }
-        visible = list(dict.fromkeys(names.get(label, label) for label in labels if label not in {"object", "thing"}))[:4]
-        return "画面中可见" + "、".join(visible) + "等主体。"
-    return "当前画面未检测到足够明确的主体，无法生成可靠概括。"
+        names = list(dict.fromkeys(item.description or item.label for item in entities))[:5]
+        return "画面中可见" + "、".join(names) + "。"
+    return "当前画面未检测到足够明确的物体主体。"
 
 
 def box_iou(first: np.ndarray, second: np.ndarray) -> float:
@@ -810,15 +978,19 @@ def suppress_sibling_overlaps(
     return sorted(kept, key=lambda item: float(scores[item]), reverse=True)
 
 
-def suppress_contextual_fruit_errors(labels: list[str], indexes: list[int]) -> list[int]:
-    """番茄植株场景中，避免同一批候选把番茄误叫成苹果/橘子。"""
-    normalized = [labels[index].lower().strip() for index in indexes]
-    tomato_count = sum(label == "tomato" for label in normalized)
-    plant_context = any(label in {"tree", "plant", "leaf", "grass", "bush", "shrub"} for label in normalized)
-    if tomato_count >= 2 and plant_context:
-        fruit_siblings = {"apple", "orange", "banana", "lemon", "watermelon", "grape", "strawberry"}
-        return [index for index in indexes if labels[index].lower().strip() not in fruit_siblings]
-    return indexes
+def suppress_contextual_fruit_errors(boxes: np.ndarray, labels: list[str], indexes: list[int]) -> list[int]:
+    """同一番茄区域被错叫成足球/head/其它果实：仅按空间重叠抑制错类。"""
+    tomatoes = [index for index in indexes if labels[index].lower().strip() in {"tomato", "tomato plant"}]
+    if not tomatoes:
+        return indexes
+    ambiguous_fruit = {"apple", "orange", "banana", "lemon", "watermelon", "grape", "strawberry", "sports ball", "soccer ball", "football", "ball", "head"}
+    kept: list[int] = []
+    for index in indexes:
+        label = labels[index].lower().strip()
+        if label in ambiguous_fruit and any(box_iou(boxes[index], boxes[tomato]) >= 0.10 for tomato in tomatoes if tomato != index):
+            continue
+        kept.append(index)
+    return kept
 
 
 def require_visible_glasses(boxes: np.ndarray, labels: list[str], indexes: list[int]) -> list[int]:
@@ -961,7 +1133,7 @@ def filter_openvino_detections(
     keep = class_aware_nms(boxes, scores, labels, MAX_OBJECTS_PER_FRAME, iou_threshold=0.45)
     keep = suppress_generic_overlaps(boxes, scores, labels, keep)
     keep = suppress_sibling_overlaps(boxes, scores, labels, keep)
-    keep = suppress_contextual_fruit_errors(labels, keep)
+    keep = suppress_contextual_fruit_errors(boxes, labels, keep)
     if color_hint:
         keep = filter_boxes_by_color(image_rgb, boxes, keep, color_hint)
     return boxes[keep], scores[keep], [labels[index] for index in keep]
@@ -1003,8 +1175,17 @@ class OpenVINOCompatibleManager:
         color_hint: str | None = None,
     ) -> list[DetectedObject]:
         resized_rgb, scale_x, scale_y = resize_for_inference(image_rgb)
+        engine_prompt = prompt
+        if referring_label and isinstance(prompt, str):
+            subject = referring_subject_recall(prompt)
+            if subject:
+                # 先跑属性短语，再用主体词召回同类实例；颜色后处理负责筛选。
+                engine_prompt = (prompt, f"{subject}.")
+        if isinstance(prompt, tuple) and prompt == UNIVERSAL_PROMPT_GROUPS:
+            # 独立处理短词组，避免长类别列表超过 256 token 后截断后半部。
+            engine_prompt = tuple(prompt[:MAX_UNIVERSAL_PROMPT_GROUPS])
         try:
-            raw_objects = self.engine.analyze(resized_rgb, prompt, referring_label, color_hint)
+            raw_objects = self.engine.analyze(resized_rgb, engine_prompt, referring_label, color_hint)
         except RuntimeError as exc:
             if "logits saturated" not in str(exc):
                 raise
@@ -1021,8 +1202,17 @@ class OpenVINOCompatibleManager:
         posed_people = 0
         for item in raw_objects:
             source_mask = item.mask if isinstance(item, DetectedObject) else item["mask"]
-            mask = np.asarray(source_mask, dtype=np.uint8)
-            if mask.shape != (original_height, original_width):
+            # 未进入 SAM2 分割预算的真实检测框用空字符串表示。先判断
+            # 空值再转数组，避免 np.asarray("", dtype=uint8) 抛出 ValueError。
+            if source_mask is None or source_mask == "":
+                mask = np.empty((0, 0), dtype=np.uint8)
+            else:
+                mask = np.asarray(source_mask, dtype=np.uint8)
+            # 低优先级目标仍保留真实检测框，但未执行 SAM2 时 mask 为空。
+            # 不能把空掩码 resize 成全图伪掩码，也不能让 cv2 对一维数组报错。
+            if mask.ndim != 2 or not mask.size:
+                mask = np.empty((0, 0), dtype=np.uint8)
+            elif mask.shape != (original_height, original_width):
                 mask = cv2.resize(mask, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
             box = item.bbox if isinstance(item, DetectedObject) else item["bbox"]
             restored_box = [
@@ -1060,7 +1250,7 @@ class OpenVINOCompatibleManager:
                 label=label,
                 score=score,
                 bbox=[round(value, 2) for value in restored_box],
-                mask=(mask > 0).astype(np.uint8).tolist(),
+                mask=(mask > 0).astype(np.uint8).tolist() if mask.size else "",
                 keypoints=keypoints,
                 description=object_description(label, restored_box, original_width, original_height),
                 caption="",
@@ -1075,6 +1265,15 @@ class OpenVINOCompatibleManager:
         referring_label: str | None,
         color_hint: str | None,
     ) -> list[DetectedObject]:
+        # 仅在 CPU 兜底时裁剪通用词表。明确文本/指代提示必须保持用户原始输入。
+        if isinstance(prompt, tuple) and prompt == UNIVERSAL_PROMPT_GROUPS:
+            groups = prompt[:MAX_UNIVERSAL_PROMPT_GROUPS]
+            prompt = tuple(groups)
+            logger.info("CPU 兜底分 %d 组短提示执行检测，确保通用类别表没有被静默截断。", len(groups))
+        elif referring_label and isinstance(prompt, str):
+            subject = referring_subject_recall(prompt)
+            if subject:
+                prompt = (prompt, f"{subject}.")
         with self._fallback_lock:
             if self.cpu_fallback is None:
                 self.cpu_fallback = PyTorchModelManager()
@@ -1168,25 +1367,29 @@ def analyze_media(
             if prompt_mode == "universal":
                 normalized_prompt = VIDEO_UNIVERSAL_PROMPT_GROUPS
             frames = [
-                VideoFrameAnnotation(timestamp=timestamp, objects=capability_enricher.enrich(image_rgb, model_manager.analyze(image_rgb, normalized_prompt, referring_label, color_hint)))
+                VideoFrameAnnotation(timestamp=timestamp, objects=capability_enricher.enrich(image_rgb, model_manager.analyze(image_rgb, normalized_prompt, referring_label, color_hint), object_factory=DetectedObject))
                 for timestamp, image_rgb in samples
             ]
             objects = frames[0].objects
             all_objects = [item for frame in frames for item in frame.objects]
+            summary_objects = _representative_video_objects(frames)
         else:
             image_rgb = decode_image(media.file.read())
-            objects = capability_enricher.enrich(image_rgb, model_manager.analyze(image_rgb, normalized_prompt, referring_label, color_hint))
+            objects = capability_enricher.enrich(image_rgb, model_manager.analyze(image_rgb, normalized_prompt, referring_label, color_hint), object_factory=DetectedObject)
             frames = []
             all_objects = objects
+            summary_objects = objects
         labels = list(dict.fromkeys(item.label for item in all_objects))
-        activity = infer_activity(all_objects, media_type)
-        feedback = describe_content(all_objects, media_type)
+        # 视频类目可汇总所有关键帧，但主体与人数描述只能来自单个代表帧，
+        # 否则同一个人会因重复抽帧被错误累计成很多人。
+        activity = infer_activity(summary_objects, media_type)
+        feedback = describe_content(summary_objects, media_type)
         compact_frames = [
-            VideoFrameAnnotation(timestamp=frame.timestamp, objects=[compact_object(item) for item in frame.objects])
+            VideoFrameAnnotation(timestamp=frame.timestamp, objects=compact_objects(frame.objects))
             for frame in frames
         ]
         return AnalyzeResponse(
-            objects=[compact_object(item) for item in objects],
+            objects=compact_objects(objects),
             labels=labels,
         feedback=feedback,
         # 前端顶部与内容摘要都优先显示可读的内容概括，实例数由语义标签和空间标注呈现。

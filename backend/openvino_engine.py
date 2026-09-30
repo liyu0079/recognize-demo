@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,11 @@ from PIL import Image
 from transformers import AutoProcessor
 
 logger = logging.getLogger("vision-annotator")
+# SAM2 解码器当前逐框运行。街景等场景若同时分割 80 个候选框，时延会从数秒
+# 放大到数分钟；默认仅对得分最高的 24 个实例生成掩码，可按设备能力上调。
+MAX_SEGMENTED_OBJECTS = max(1, int(os.getenv("MAX_SEGMENTED_OBJECTS", "24")))
+MAX_RESPONSE_OBJECTS = max(MAX_SEGMENTED_OBJECTS, int(os.getenv("MAX_RESPONSE_OBJECTS", "80")))
+MAX_POSE_PERSONS = max(0, int(os.getenv("MAX_POSE_PERSONS", "12")))
 
 
 class DegradedDetectionOutput(RuntimeError):
@@ -130,7 +136,12 @@ class OpenVINOModelManager:
             model_path = self.model_dir / f"{name}.xml"
             preferred = self._device()
             try:
-                compiled = self.core.compile_model(str(model_path), preferred)
+                # GroundingDINO 的文本分类 logits 对 FP16 极其敏感。在 Arc
+                # 默认精度下会将有效的 -0.x 分数压低到检测阈值以下，造成
+                # 大量漏检。检测模型强制 FP32；SAM2/RTMPose 继续保持默认
+                # 精度，兼顾召回与整体时延。
+                config = {"INFERENCE_PRECISION_HINT": "f32"} if name == "grounding_dino" and preferred.startswith("GPU") else {}
+                compiled = self.core.compile_model(str(model_path), preferred, config)
                 device = preferred
             except Exception as exc:
                 if preferred == "CPU":
@@ -237,8 +248,12 @@ class OpenVINOModelManager:
         # FP16-compressed Grounding DINO IR can saturate almost every logit at
         # -65504 (or -inf on CPU). post_process then returns an empty list and
         # makes a healthy request look like a valid "no object" result.
-        saturated = np.count_nonzero(~np.isfinite(logits) | (logits <= -65000))
-        if saturated / logits.size > 0.9:
+        # 无关 token 被文本注意力掩码为 -inf/-65504 是正常输出，不能按
+        # 全张 logits 比例判定“饱和”。只有绝大多数 query 的最大有效分数
+        # 也无效时，才说明推理输出真正退化。
+        query_best = np.max(logits, axis=-1)
+        saturated = np.count_nonzero(~np.isfinite(query_best) | (query_best <= -65000))
+        if saturated / query_best.size > 0.9:
             raise DegradedDetectionOutput("Grounding DINO OpenVINO logits saturated")
         result = SimpleNamespace(
             logits=torch.from_numpy(logits),
@@ -344,12 +359,28 @@ class OpenVINOModelManager:
             if not len(boxes):
                 return []
             boxes, scores, labels = self.post_filter(boxes, scores, labels, image, color_hint)
-            masks = self._segment(image, boxes)
+            order = np.argsort(scores)[::-1][:MAX_RESPONSE_OBJECTS]
+            boxes = boxes[order]
+            scores = scores[order]
+            labels = [labels[index] for index in order]
+            segment_count = min(MAX_SEGMENTED_OBJECTS, len(boxes))
+            segment_boxes = boxes[:segment_count]
+            if len(boxes) > segment_count:
+                logger.info(
+                    "OpenVINO 返回 %d 个检测实例，仅对得分最高的 %d 个执行 SAM2 分割。",
+                    len(boxes), segment_count,
+                )
+            masks = self._segment(image, segment_boxes)
             objects: list[dict[str, Any]] = []
-            for box, score, label, mask in zip(boxes, scores, labels, masks):
+            posed_people = 0
+            for index, (box, score, label) in enumerate(zip(boxes, scores, labels)):
+                mask = masks[index] if index < len(masks) else np.empty((0, 0), dtype=np.uint8)
                 final_label = referring_label or label
                 try:
-                    keypoints = self._pose(image, box) if final_label.lower() == "person" and self._ir_exists("rtmpose_tiny") else []
+                    should_pose = final_label.lower() == "person" and self._ir_exists("rtmpose_tiny") and posed_people < MAX_POSE_PERSONS
+                    keypoints = self._pose(image, box) if should_pose else []
+                    if keypoints:
+                        posed_people += 1
                 except Exception as exc:
                     logger.warning("RTMPose-tiny 不可用，将跳过人体姿态：%s", exc)
                     keypoints = []
@@ -357,5 +388,5 @@ class OpenVINOModelManager:
                 if final_label.lower() in {"hand", "hands"} and self._ir_exists("rtmpose_hand"):
                     points = self.estimate_hand_pose(image, box)
                     hand_keypoints = [points] if len(points) == 21 else []
-                objects.append({"label": final_label, "score": round(float(score), 4), "bbox": [round(float(v), 2) for v in box], "mask": mask.tolist(), "keypoints": keypoints, "hand_keypoints": hand_keypoints})
+                objects.append({"label": final_label, "score": round(float(score), 4), "bbox": [round(float(v), 2) for v in box], "mask": mask.tolist() if mask.size else "", "keypoints": keypoints, "hand_keypoints": hand_keypoints})
             return objects

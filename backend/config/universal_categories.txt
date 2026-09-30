@@ -1,7 +1,12 @@
 helmet
-text
 vest
 license plate
+manhole cover
+air conditioner
+tomato plant
+shop sign
+storefront
+awning
 street lamp
 fire hydrant
 bench

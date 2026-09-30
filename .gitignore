@@ -14,6 +14,7 @@ dist-ssr
 backend/.venv/
 backend/models/
 backend/__pycache__/
+backend/.hf_modules_cache/
 weights/
 
 # Editor directories and files

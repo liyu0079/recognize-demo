@@ -1,5 +1,6 @@
 param(
     [switch]$SkipModelExport,
+    [switch]$SkipModelDownload,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RemainingArgs
 )
@@ -8,6 +9,7 @@ $ErrorActionPreference = "Stop"
 # Only change execution policy for this PowerShell process.
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 $SkipModelExport = $SkipModelExport -or ($RemainingArgs -contains "--SkipModelExport")
+$SkipModelDownload = $SkipModelDownload -or ($RemainingArgs -contains "--SkipModelDownload")
 $BackendRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvRoot = Join-Path $BackendRoot ".venv"
 $Python = Join-Path $VenvRoot "Scripts\python.exe"
@@ -108,6 +110,7 @@ Write-Host "[2/4] Installing compatible pip, setuptools, and wheel" -ForegroundC
 if ($LASTEXITCODE -ne 0) { throw "Failed to upgrade Python packaging tools." }
 
 $TorchIndex = "https://download.pytorch.org/whl/cpu"
+$PypiMirror = "https://pypi.tuna.tsinghua.edu.cn/simple"
 Write-Host "[3/4] Installing CPU PyTorch, OpenVINO, and backend dependencies" -ForegroundColor Cyan
 & $Python -m pip install torch==2.5.1 torchvision==0.20.1 --index-url $TorchIndex
 if ($LASTEXITCODE -ne 0) { throw "Failed to install CPU PyTorch." }
@@ -117,21 +120,37 @@ try {
     # RTMPose is converted from its official ONNX artifact. The OpenMMLab Python
     # stack remains documented in requirements but is not needed at runtime.
     Get-Content -LiteralPath $RequirementsFile | Where-Object { $_ -notmatch '^(mmpose|mmdet|mmcv-lite|mmengine)==' } | Set-Content -LiteralPath $RuntimeRequirements -Encoding Ascii
-    & $Python -m pip install -r $RuntimeRequirements
+    # 使用国内镜像安装 PaddlePaddle/PaddleOCR doc-parser 等 CPU 依赖；
+    # PyTorch 已在上方通过其官方 CPU 索引单独安装。
+    & $Python -m pip install -r $RuntimeRequirements -i $PypiMirror
     if ($LASTEXITCODE -ne 0) { throw "Failed to install backend runtime dependencies." }
 }
 finally {
     Remove-Item -LiteralPath $RuntimeRequirements -Force -ErrorAction SilentlyContinue
 }
 
-& $Python -c "import torch, openvino; print('PyTorch:', torch.__version__); print('OpenVINO:', openvino.__version__)"
+# Avoid importing Paddle/PaddleOCR during setup. Paddle's import probes optional
+# C++ tools on Windows and prints misleading "could not find files"/ccache
+# messages even when the package is installed correctly. Metadata validation is
+# enough here; FastAPI performs the actual local OCR-model check lazily.
+Write-Host "[verify] Checking installed package versions (PaddleOCR loads when the service starts)" -ForegroundColor Cyan
+& $Python -u -c "import sys, importlib.metadata as md, torch, openvino; print('Python:', sys.version.split()[0], flush=True); print('PyTorch:', torch.__version__, flush=True); print('OpenVINO:', openvino.__version__, flush=True); print('PaddlePaddle:', md.version('paddlepaddle'), flush=True); print('PaddleOCR:', md.version('paddleocr'), flush=True)"
 if ($LASTEXITCODE -ne 0) { throw "Python environment validation failed." }
 
 Write-Host "[4/4] Downloading domestic model assets and auditing checksums" -ForegroundColor Cyan
 Push-Location $BackendRoot
 try {
-    # --SkipModelExport skips only ONNX/IR export; asset download and MD5 audit still run.
-    & $Python model_downloader.py
+    # --SkipModelExport skips only ONNX/IR export. --SkipModelDownload is for
+    # repairing the Python environment while offline; it still performs a
+    # visible local audit so no model is falsely reported ready.
+    if ($SkipModelDownload) {
+        Write-Host "[models] Download skipped by --SkipModelDownload; auditing local assets only." -ForegroundColor Yellow
+        & $Python -u model_downloader.py --no-download
+    }
+    else {
+        Write-Host "[models] ModelScope download/audit started. Large files show MD5 progress below." -ForegroundColor Cyan
+        & $Python -u model_downloader.py
+    }
     if ($LASTEXITCODE -ne 0) { throw "Model asset download or audit failed." }
     if (-not $SkipModelExport) {
         Write-Host "[export] Exporting local OpenVINO IR" -ForegroundColor Cyan
