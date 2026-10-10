@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,7 @@ class FullCapabilityEnricher:
         self._caption_load_attempted = False
         self._hand = LiteRTHandPoseRuntime(self.hand_model_path)
         self._local_caption = LocalMoondreamRuntime(self.moondream_model_dir)
+        self.last_metrics: dict[str, float] = {"ocr": 0.0, "caption": 0.0, "hand_pose": 0.0}
         # 启动时只审计本地文件；AUTO_DOWNLOAD_MODELS=1 时才会下载。
         self.asset_report = startup_audit()
 
@@ -95,16 +97,14 @@ class FullCapabilityEnricher:
                 "error": self._ocr_error,
             },
             "hand_pose": self._hand.status(),
-            # 健康检查只检查资产与运行时，不触发数 GB 的 Caption 懒加载。
-            # IR 不存在时，caption() 会使用同一份本地 safetensors 的 CPU
-            # 实现，状态中明确标出实际引擎，绝不把 CPU 说成 OpenVINO。
+            # // 优化：Caption 健康规范 - 只有 Stateful OpenVINO IR 才能启用描述能力。
+            # 原始 safetensors 只是资产存在，不能被当作稳定的在线 Caption 服务。
             "caption": {
-                **self._local_caption.status(),
-                "available": self._caption_ir_dir() is not None or self._local_caption.available,
-                "engine": "openvino" if self._caption_ir_dir() is not None else "pytorch-cpu",
+                "available": self._caption_ir_dir() is not None,
+                "engine": "openvino" if self._caption_ir_dir() is not None else "unavailable",
                 "openvino_ir": self._caption_ir_dir() is not None,
                 "openvino_dir": str(self.caption_model_dir),
-                "error": self._caption_error or self._local_caption.status()["error"],
+                "error": self._caption_error or (None if self._caption_ir_dir() is not None else "Moondream2 OpenVINO Stateful IR 尚未导出，Caption 暂不可用"),
             },
         }
 
@@ -207,6 +207,14 @@ class FullCapabilityEnricher:
                         if value:
                             regions.append((value, (float(x1), float(y1), float(x2), float(y2))))
         return regions
+
+    def scan_ocr(self, image: np.ndarray) -> list[tuple[str, tuple[float, float, float, float]]]:
+        """Public whole-image OCR entry point for the pipeline's parallel stage."""
+        started = time.perf_counter()
+        try:
+            return self._ocr_regions(image)
+        finally:
+            self.last_metrics["ocr"] = round((time.perf_counter() - started) * 1000, 2)
 
     @staticmethod
     def _ocr_region_label(
@@ -322,7 +330,8 @@ class FullCapabilityEnricher:
             except Exception as exc:  # pragma: no cover - optional dependency
                 self._caption_error = str(exc)
                 logger.warning("Moondream OpenVINO 局部描述失败，将尝试本地 CPU：%s", exc)
-        return self._local_caption.caption(crop)
+        # // 优化：Caption 失效保护 - IR 缺失时返回空字段，禁止用 CPU 权重伪装稳定能力。
+        return ""
 
     def _load_caption(self) -> Any | None:
         if self._caption is not None:
@@ -348,15 +357,24 @@ class FullCapabilityEnricher:
             logger.warning("Moondream OpenVINO GenAI 未加载：%s", exc)
         return self._caption
 
-    def enrich(self, image: np.ndarray, objects: list[Any], object_factory: Any | None = None) -> list[Any]:
+    def enrich(
+        self,
+        image: np.ndarray,
+        objects: list[Any],
+        object_factory: Any | None = None,
+        *,
+        include_caption: bool = False,
+        ocr_regions: list[tuple[str, tuple[float, float, float, float]]] | None = None,
+    ) -> list[Any]:
         height, width = image.shape[:2]
-        # OCR 独立覆盖整张图；即使 GroundingDINO 没有返回物体，也不能因此跳过文字识别。
-        try:
-            ocr_regions = self._ocr_regions(image)
-        except Exception as exc:  # pragma: no cover - optional dependency
-            self._ocr_error = str(exc)
-            logger.warning("PaddleOCR 整图识别失败：%s", exc)
-            ocr_regions = []
+        if ocr_regions is None:
+            # OCR 独立覆盖整张图；即使 GroundingDINO 没有返回物体，也不能因此跳过文字识别。
+            try:
+                ocr_regions = self.scan_ocr(image)
+            except Exception as exc:  # pragma: no cover - optional dependency
+                self._ocr_error = str(exc)
+                logger.warning("PaddleOCR 整图识别失败：%s", exc)
+                ocr_regions = []
 
         # OCR 的检测框本身是最小可追溯文字区域。除向相交的物体框回填文字
         # 外，还返回独立 text 实例，前端可像 DINO-X 一样在车牌、招牌等文字
@@ -384,6 +402,7 @@ class FullCapabilityEnricher:
                     ))
                 except (TypeError, ValueError) as exc:
                     logger.warning("OCR 文字框无法写入统一结果：%s", exc)
+        caption_ms = 0.0
         for index, item in enumerate(objects):
             x1, y1, x2, y2 = [int(max(0, value)) for value in item.bbox]
             x2, y2 = min(width, max(x1 + 1, x2)), min(height, max(y1 + 1, y2))
@@ -393,8 +412,10 @@ class FullCapabilityEnricher:
             if str(item.label).lower() in {"hand", "hands", "手", "手部"} and not getattr(item, "hand_keypoints", []):
                 item.hand_keypoints = [self._hand.estimate(image, np.asarray(item.bbox, dtype=np.float32))]
                 item.hand_keypoints = [points for points in item.hand_keypoints if len(points) == 21]
-            # Caption 真实推理成本高，只覆盖最高优先级对象；其余框继续返回
-            # 真实检测/OCR/几何描述，不以模板冒充模型 Caption。
-            if crop.size and index < MAX_CAPTION_OBJECTS:
+            # // 优化：Caption 延迟调度 - API 首次结果不等待描述；IR 就绪后的按需调用才允许生成。
+            if include_caption and self._caption_ir_dir() is not None and crop.size and not item.ocr_text and index < MAX_CAPTION_OBJECTS:
+                started = time.perf_counter()
                 item.caption = self.caption(crop)
+                caption_ms += (time.perf_counter() - started) * 1000
+        self.last_metrics = {"ocr": self.last_metrics.get("ocr", 0.0), "caption": round(caption_ms, 2), "hand_pose": 0.0}
         return objects + text_objects

@@ -4,11 +4,14 @@ import logging
 import json
 import math
 import os
+import ctypes
 import re
 import tempfile
 import threading
 import time
+import tracemalloc
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from contextlib import nullcontext
 from io import BytesIO
@@ -27,6 +30,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel
 from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 from full_capabilities import FullCapabilityEnricher
+from recall_scheduler import Candidate, adaptive_soft_nms, conservative_semantic_deduplicate, validate_high_risk_candidates
 
 # ======================== 可配置参数 ========================
 USE_OPENVINO = os.getenv("USE_OPENVINO", "1") not in {"0", "false", "False"}
@@ -37,6 +41,9 @@ OPENVINO_IDLE_SECONDS = int(os.getenv("OPENVINO_IDLE_SECONDS", "90"))
 VIDEO_SAMPLE_INTERVAL_SECONDS = 3.0  # 视频每隔约 3 秒取一个关键帧
 VIDEO_MIN_SAMPLE_COUNT = 4
 VIDEO_MAX_SAMPLE_COUNT = 18
+# // 优化：视频关键帧 - 低成本画面变化扫描只决定哪些帧进入重型检测。
+VIDEO_SCENE_SCAN_INTERVAL_SECONDS = float(os.getenv("VIDEO_SCENE_SCAN_INTERVAL_SECONDS", "0.75"))
+VIDEO_SCENE_CHANGE_THRESHOLD = float(os.getenv("VIDEO_SCENE_CHANGE_THRESHOLD", "0.28"))
 MAX_OBJECTS_PER_FRAME = int(os.getenv("MAX_OBJECTS_PER_FRAME", "100"))
 # 检测框和 SAM2 掩码是两种不同成本。所有通过 NMS 的真实检测都会返回，
 # 只有最高分的一部分进入分割，避免街景等场景因几十个框进入分钟级等待。
@@ -48,6 +55,13 @@ MAX_SEGMENTED_OBJECTS = max(1, int(os.getenv("MAX_SEGMENTED_OBJECTS", "24")))
 # universal_categories.txt 的扩展组；这样不会让旧词表中的服饰等噪声拖慢默认检测。
 MAX_UNIVERSAL_PROMPT_GROUPS = max(1, int(os.getenv("MAX_UNIVERSAL_PROMPT_GROUPS", "4")))
 MAX_POSE_PERSONS = int(os.getenv("MAX_POSE_PERSONS", "12"))
+# // 优化：双运行模式 - fast 默认只在触发时切片；full 保证执行局部补检但不扩大 SAM2 配额。
+DEFAULT_RUN_MODE = os.getenv("DEFAULT_RUN_MODE", "fast").lower()
+if DEFAULT_RUN_MODE not in {"fast", "full"}:
+    DEFAULT_RUN_MODE = "fast"
+ENABLE_STAGED_RECALL = os.getenv("ENABLE_STAGED_RECALL", "1") not in {"0", "false", "False"}
+ENABLE_TILE_RECALL = os.getenv("ENABLE_TILE_RECALL", "1") not in {"0", "false", "False"}
+RAW_CANDIDATE_LIMIT = max(1, int(os.getenv("RAW_CANDIDATE_LIMIT", "240")))
 
 # 无需提示模式使用本地 Grounding DINO 的常见主体类别词表。Grounding DINO 本身需要
 # 文本输入，因此这不是云端“万物模型”，而是可审计、可按业务扩充的本地候选集合。
@@ -234,6 +248,17 @@ class DetectedObject(BaseModel):
     ocr_text: str = ""
     description: str = ""
     caption: str = ""
+    track_id: str = ""
+
+
+class RawCandidate(BaseModel):
+    """Debug-only candidate trace: distinguishes model misses from suppression."""
+
+    label: str
+    score: float
+    bbox: list[float]
+    stage: int = 1
+    tile_id: str = "full"
 
 
 def local_capabilities() -> dict[str, dict[str, Any]]:
@@ -311,6 +336,32 @@ def _finite_number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def process_memory_usage_mb() -> tuple[float, float]:
+    """Return current and peak process working set without adding a psutil dependency."""
+    # // 优化：资源监控 - Windows 工作集反映真实进程内存，不只统计 Python 堆分配。
+    if os.name != "nt":
+        return 0.0, 0.0
+    try:
+        class Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        success = ctypes.windll.psapi.GetProcessMemoryInfo(  # type: ignore[attr-defined]
+            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb,  # type: ignore[attr-defined]
+        )
+        if success:
+            return round(counters.WorkingSetSize / 1024 / 1024, 2), round(counters.PeakWorkingSetSize / 1024 / 1024, 2)
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
 def _compact_keypoints(points: Any) -> list[dict[str, float]]:
     """只保留模型实际返回且坐标、置信度均为有限值的关键点。"""
     cleaned: list[dict[str, float]] = []
@@ -356,6 +407,7 @@ def compact_object(item: DetectedObject) -> DetectedObject | None:
         ocr_text=str(item.ocr_text or ""),
         description=str(item.description or ""),
         caption=str(item.caption or ""),
+        track_id=str(item.track_id or ""),
     )
 
 
@@ -367,6 +419,7 @@ def compact_objects(items: list[DetectedObject]) -> list[DetectedObject]:
 class VideoFrameAnnotation(BaseModel):
     timestamp: float
     objects: list[DetectedObject]
+    is_keyframe: bool = True
 
 
 class AnalyzeResponse(BaseModel):
@@ -379,6 +432,23 @@ class AnalyzeResponse(BaseModel):
     media_type: Literal["image", "video"]
     frames: list[VideoFrameAnnotation] = []
     activity: str = ""
+    run_mode: Literal["fast", "full"] = "fast"
+    raw_candidates: list[RawCandidate] = []
+    timings_ms: dict[str, float] = {}
+    resource_usage: dict[str, float] = {}
+
+
+class SegmentResponse(BaseModel):
+    bbox: list[float]
+    mask_rle: str
+    mask_size: list[int]
+
+
+class CaptionTaskResponse(BaseModel):
+    task_id: str
+    status: Literal["queued", "running", "completed", "failed", "unavailable"]
+    caption: str = ""
+    error: str = ""
 
 
 class PyTorchModelManager:
@@ -395,6 +465,7 @@ class PyTorchModelManager:
         self.load_finished_at: float | None = None
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
+        self.last_diagnostics: dict[str, Any] = {"raw_candidates": [], "timings_ms": {}}
 
     @property
     def ready(self) -> bool:
@@ -491,12 +562,28 @@ class PyTorchModelManager:
     def _autocast_context(self):
         return nullcontext()
 
+    def segment_box(self, image_rgb: np.ndarray, bbox: list[float]) -> np.ndarray:
+        """Run SAM2 for one user-selected original-image box only."""
+        if not self.ready:
+            raise RuntimeError(self.load_error or "本地模型尚未加载完成")
+        resized, scale_x, scale_y = resize_for_inference(image_rgb)
+        box = np.asarray([[bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y]], dtype=np.float32)
+        with self._inference_lock, torch.inference_mode():
+            self.sam_predictor.set_image(resized)
+            masks, _, _ = self.sam_predictor.predict(point_coords=None, point_labels=None, box=box, multimask_output=False)
+        mask = normalize_sam_masks(np.asarray(masks), 1)[0]
+        if mask.shape != image_rgb.shape[:2]:
+            mask = cv2.resize(mask.astype(np.uint8), (image_rgb.shape[1], image_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        return (mask > 0).astype(np.uint8)
+
     def analyze(
         self,
         image_rgb: np.ndarray,
         prompt: str | tuple[str, ...],
         referring_label: str | None = None,
         color_hint: str | None = None,
+        run_mode: Literal["fast", "full"] = "fast",
+        lightweight: bool = False,
     ) -> list[DetectedObject]:
         if not self.ready:
             reason = self.load_error or "模型尚未加载完成"
@@ -549,18 +636,25 @@ class PyTorchModelManager:
             boxes = np.concatenate(batch_boxes, axis=0) if batch_boxes else np.empty((0, 4))
             scores = np.concatenate(batch_scores, axis=0) if batch_scores else np.empty((0,))
 
+            raw_candidates = [
+                {"bbox": [float(value) for value in box], "score": float(score), "label": label, "stage": 1, "tile_id": "full"}
+                for box, score, label in zip(boxes, scores, labels)
+            ]
             if len(boxes) == 0:
+                self.last_diagnostics = {"raw_candidates": raw_candidates, "timings_ms": {"dino_detection": 0.0, "nms_postprocess": 0.0, "sam2_segmentation": 0.0}}
                 return []
 
+            # // 优化：CPU 回退一致性 - 不再应用会删掉相邻小目标的泛类/果实硬过滤。
             keep_indexes = class_aware_nms(boxes, scores, labels, MAX_OBJECTS_PER_FRAME, iou_threshold=0.45)
-            keep_indexes = suppress_generic_overlaps(boxes, scores, labels, keep_indexes)
-            keep_indexes = suppress_sibling_overlaps(boxes, scores, labels, keep_indexes)
-            keep_indexes = suppress_contextual_fruit_errors(boxes, labels, keep_indexes)
+            # // 优化：类别真实性校验 - CPU 兜底路径使用与 OpenVINO 相同的高风险类校验。
+            keep_indexes = keep_validated_high_risk_indexes(resized_rgb, boxes, scores, labels, keep_indexes)
             if strict_glasses:
                 keep_indexes = require_visible_glasses(boxes, labels, keep_indexes)
             if color_hint:
                 keep_indexes = filter_boxes_by_color(resized_rgb, boxes, keep_indexes, color_hint)
-            keep_indexes = sorted(keep_indexes, key=lambda index: float(scores[index]), reverse=True)[:MAX_RESPONSE_OBJECTS]
+            if not color_hint:
+                keep_indexes = sorted(keep_indexes, key=lambda index: float(scores[index]), reverse=True)
+            keep_indexes = keep_indexes[:MAX_RESPONSE_OBJECTS]
             segment_indexes = keep_indexes[:MAX_SEGMENTED_OBJECTS]
             if len(keep_indexes) > MAX_SEGMENTED_OBJECTS:
                 logger.info(
@@ -607,13 +701,13 @@ class PyTorchModelManager:
             source_index = keep_indexes[index]
             mask_position = segment_positions.get(source_index)
             mask = masks[mask_position] if mask_position is not None else None
-            if mask is not None and mask.shape != (original_height, original_width):
+            if mask is not None and mask.size and mask.shape != (original_height, original_width):
                 mask = cv2.resize(
                     mask.astype(np.uint8),
                     (original_width, original_height),
                     interpolation=cv2.INTER_NEAREST,
                 )
-            binary_mask = (mask > 0).astype(np.uint8) if mask is not None else None
+            binary_mask = (mask > 0).astype(np.uint8) if mask is not None and mask.size else None
             original_box = [
                 float(box[0] / scale_x),
                 float(box[1] / scale_y),
@@ -635,6 +729,7 @@ class PyTorchModelManager:
             )
 
         logger.info("SAM2 分割完成，返回 %d 个检测实例，其中 %d 个带真实掩码。", len(detected), len(segment_boxes))
+        self.last_diagnostics = {"raw_candidates": raw_candidates, "timings_ms": {}, "fallback": "pytorch"}
         return detected
 
 
@@ -674,7 +769,7 @@ def filter_boxes_by_color(
     indexes: list[int],
     color: str,
 ) -> list[int]:
-    """用 HSV 颜色占比约束指代提示，减少“紫色衣服”命中所有人物的问题。"""
+    """按 HSV 颜色证据重排，不把颜色作为硬删除条件。"""
     image_h, image_w = image_rgb.shape[:2]
     hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
     candidates: list[tuple[int, float]] = []
@@ -704,13 +799,9 @@ def filter_boxes_by_color(
         coverage = float(mask.mean())
         if coverage >= 0.065:
             candidates.append((index, coverage))
-    if not candidates:
-        return []
-    # 颜色指代是证据约束，不是“只取最红的一框”。同一场景可能有多个
-    # 颜色相近的目标（例如七个西红柿），按最高覆盖率截断会直接丢实例。
-    best_coverage = max(coverage for _, coverage in candidates)
-    minimum = max(0.035, best_coverage * 0.38)
-    return [index for index, coverage in candidates if coverage >= minimum]
+    # // 优化：颜色策略 - 所有候选都保留；HSV 覆盖率只影响展示/后续排序。
+    coverage_by_index = dict(candidates)
+    return sorted(indexes, key=lambda index: coverage_by_index.get(index, 0.0), reverse=True)
 
 
 def referring_subject_recall(prompt: str) -> str | None:
@@ -824,6 +915,34 @@ def _representative_video_objects(frames: list[VideoFrameAnnotation]) -> list[De
     return best
 
 
+def link_video_tracks(frames: list[VideoFrameAnnotation]) -> None:
+    """Assign lightweight IoU tracks to people/vehicles across sampled frames."""
+    # // 优化：跨帧跟踪 - 不把同一车辆/人物在相邻关键帧重复计为新实例。
+    tracked_labels = VEHICLE_LABELS | PERSON_LABELS
+    active: dict[str, tuple[str, list[float]]] = {}
+    sequence = 0
+    for frame in frames:
+        used: set[str] = set()
+        for item in frame.objects:
+            label = item.label.lower().strip()
+            if label not in tracked_labels:
+                continue
+            match = next(
+                (
+                    track_id for track_id, (track_label, track_box) in active.items()
+                    if track_id not in used and track_label == label
+                    and box_iou(np.asarray(track_box, dtype=np.float32), np.asarray(item.bbox, dtype=np.float32)) >= 0.28
+                ),
+                None,
+            )
+            if match is None:
+                sequence += 1
+                match = f"{label}-{sequence}"
+            item.track_id = match
+            active[match] = (label, list(item.bbox))
+            used.add(match)
+
+
 def infer_activity(objects: list[DetectedObject], media_type: str) -> str:
     entities = _content_objects(objects)
     labels = [item.label.lower().strip() for item in entities]
@@ -894,22 +1013,40 @@ def class_aware_nms(
     max_count: int,
     iou_threshold: float = 0.62,
 ) -> list[int]:
-    """保留同一类别的最佳候选，避免分组提示造成重复框。"""
-    selected: list[int] = []
-    by_label: dict[str, list[int]] = {}
-    for index, label in enumerate(labels):
-        by_label.setdefault(label.lower().strip(), []).append(index)
-    for indexes in by_label.values():
-        for index in sorted(indexes, key=lambda item: float(scores[item]), reverse=True):
-            current_label = labels[index].lower().strip()
-            same_class_selected = [existing for existing in selected if labels[existing].lower().strip() == current_label]
-            if all(box_iou(boxes[index], boxes[existing]) < iou_threshold for existing in same_class_selected):
-                selected.append(index)
-                if len(selected) >= max_count:
-                    break
-        if len(selected) >= max_count:
-            break
-    return sorted(selected, key=lambda item: float(scores[item]), reverse=True)
+    """Soft-NMS: decay dense same-class overlaps rather than hard-deleting them."""
+    # // 优化：自适应 NMS - 小目标阈值更低且使用分数衰减，避免密集番茄被硬删除。
+    height = max(1, int(np.max(boxes[:, 3])) if len(boxes) else 1)
+    width = max(1, int(np.max(boxes[:, 2])) if len(boxes) else 1)
+    candidates = [Candidate(tuple(float(value) for value in boxes[index]), float(scores[index]), labels[index]) for index in range(len(boxes))]
+    selected = adaptive_soft_nms(candidates, (height, width), min_score=0.03, max_count=max_count)
+    # Map by a stable (box, label) key; candidate values are copied by Soft-NMS.
+    result: list[int] = []
+    consumed: set[int] = set()
+    for item in selected:
+        matches = [
+            index for index in range(len(boxes))
+            if index not in consumed and labels[index] == item.label and np.allclose(boxes[index], np.asarray(item.bbox), atol=0.01)
+        ]
+        if matches:
+            result.append(matches[0])
+            consumed.add(matches[0])
+    return result
+
+
+def keep_validated_high_risk_indexes(
+    image_rgb: np.ndarray, boxes: np.ndarray, scores: np.ndarray, labels: list[str], indexes: list[int],
+) -> list[int]:
+    """Map category-validated candidates back to source indexes for the CPU path."""
+    candidates = [Candidate(tuple(float(value) for value in boxes[index]), float(scores[index]), labels[index]) for index in indexes]
+    accepted = validate_high_risk_candidates(image_rgb, candidates)
+    kept: list[int] = []
+    remaining = list(indexes)
+    for candidate in accepted:
+        match = next((index for index in remaining if labels[index] == candidate.label and np.allclose(boxes[index], np.asarray(candidate.bbox), atol=0.01)), None)
+        if match is not None:
+            kept.append(match)
+            remaining.remove(match)
+    return kept
 
 
 def suppress_generic_overlaps(
@@ -1048,6 +1185,9 @@ def resize_for_inference(image_rgb: np.ndarray) -> tuple[np.ndarray, float, floa
 
 
 def normalize_sam_masks(masks: np.ndarray, expected_count: int) -> np.ndarray:
+    # // 优化：检测/分割解耦 - 分割失败时保留空 mask 槽位，不丢弃已确认检测框。
+    if expected_count and masks.size == 0:
+        return np.empty((expected_count, 0, 0), dtype=np.uint8)
     if masks.ndim == 4 and masks.shape[1] == 1:
         masks = masks[:, 0]
     elif masks.ndim == 2:
@@ -1069,7 +1209,7 @@ def decode_image(data: bytes) -> np.ndarray:
         raise HTTPException(status_code=400, detail="图片损坏或格式不受支持。") from exc
 
 
-def decode_video_sample_frames(upload: UploadFile, suffix: str) -> list[tuple[float, np.ndarray]]:
+def decode_video_sample_frames(upload: UploadFile, suffix: str) -> list[tuple[float, np.ndarray, bool]]:
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
@@ -1092,9 +1232,33 @@ def decode_video_sample_frames(upload: UploadFile, suffix: str) -> list[tuple[fl
                 target_times = list(np.linspace(0.0, max(duration, 0.0), VIDEO_MIN_SAMPLE_COUNT))
             elif len(target_times) > VIDEO_MAX_SAMPLE_COUNT:
                 target_times = list(np.linspace(0.0, max(duration, 0.0), VIDEO_MAX_SAMPLE_COUNT))
-            indexes = sorted({max(0, min(frame_count - 1, round(timestamp * fps))) for timestamp in target_times})
-            logger.info("视频时长 %.2fs，按 %.1fs 间隔抽取 %d 个关键帧。", duration, VIDEO_SAMPLE_INTERVAL_SECONDS, len(indexes))
-            samples: list[tuple[float, np.ndarray]] = []
+            fixed_indexes = {max(0, min(frame_count - 1, round(timestamp * fps))) for timestamp in target_times}
+            # // 优化：场景变化选帧 - 用缩小灰度直方图筛选突变帧，不在扫描阶段跑模型。
+            scene_scores: list[tuple[float, int]] = []
+            previous_hist: np.ndarray | None = None
+            scan_step = max(1, round(max(1.0, fps) * VIDEO_SCENE_SCAN_INTERVAL_SECONDS))
+            for index in range(0, frame_count, scan_step):
+                capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                success, frame_bgr = capture.read()
+                if not success or frame_bgr is None:
+                    continue
+                gray = cv2.resize(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), (64, 36), interpolation=cv2.INTER_AREA)
+                hist = cv2.calcHist([gray], [0], None, [32], [0, 256])
+                hist = cv2.normalize(hist, None).reshape(-1)
+                if previous_hist is not None:
+                    score = float(cv2.compareHist(previous_hist.astype(np.float32), hist.astype(np.float32), cv2.HISTCMP_BHATTACHARYYA))
+                    if score >= VIDEO_SCENE_CHANGE_THRESHOLD:
+                        scene_scores.append((score, index))
+                previous_hist = hist
+            available = max(0, VIDEO_MAX_SAMPLE_COUNT - len(fixed_indexes))
+            change_indexes = [index for _, index in sorted(scene_scores, reverse=True)[:available]]
+            indexes = sorted(fixed_indexes | set(change_indexes))[:VIDEO_MAX_SAMPLE_COUNT]
+            # 场景突变、首尾帧是重推理关键帧；基础采样帧仅做轻量检测以维持轨迹连续性。
+            key_indexes = set(change_indexes)
+            if indexes:
+                key_indexes.update({indexes[0], indexes[-1]})
+            logger.info("视频时长 %.2fs，固定帧 %d 个，场景变化补充 %d 个。", duration, len(fixed_indexes), len(change_indexes))
+            samples: list[tuple[float, np.ndarray, bool]] = []
             for frame_index in indexes:
                 capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                 success, frame_bgr = capture.read()
@@ -1102,7 +1266,7 @@ def decode_video_sample_frames(upload: UploadFile, suffix: str) -> list[tuple[fl
                     logger.warning("跳过无法读取的视频帧：%d", frame_index)
                     continue
                 timestamp = frame_index / fps if fps > 0 else float(frame_index)
-                samples.append((round(timestamp, 3), cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)))
+                samples.append((round(timestamp, 3), cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), frame_index in key_indexes))
         finally:
             capture.release()
 
@@ -1125,18 +1289,41 @@ def filter_openvino_detections(
     image_rgb: np.ndarray,
     color_hint: str | None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """复用旧路径的 NMS/语义去重规则，确保两引擎输出行为一致。"""
+    """Recall-first post-processing shared by OpenVINO and CPU fallback."""
     if not len(boxes):
         return boxes, scores, labels
     boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, image_rgb.shape[1] - 1)
     boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, image_rgb.shape[0] - 1)
-    keep = class_aware_nms(boxes, scores, labels, MAX_OBJECTS_PER_FRAME, iou_threshold=0.45)
-    keep = suppress_generic_overlaps(boxes, scores, labels, keep)
-    keep = suppress_sibling_overlaps(boxes, scores, labels, keep)
-    keep = suppress_contextual_fruit_errors(boxes, labels, keep)
+    # // 优化：跨阶段/跨切片合并 - Soft-NMS 后仅移除近乎完全重叠的父子泛类框。
+    candidates = [Candidate(tuple(float(value) for value in boxes[index]), float(scores[index]), labels[index]) for index in range(len(boxes))]
+    # // 优化：类别真实性校验 - 高风险开放词必须通过几何/色彩/上下文验证才进入 Soft-NMS。
+    candidates = validate_high_risk_candidates(image_rgb, candidates)
+    candidates = adaptive_soft_nms(candidates, image_rgb.shape[:2], min_score=0.03, max_count=MAX_OBJECTS_PER_FRAME)
+    candidates = conservative_semantic_deduplicate(candidates)
     if color_hint:
-        keep = filter_boxes_by_color(image_rgb, boxes, keep, color_hint)
-    return boxes[keep], scores[keep], [labels[index] for index in keep]
+        hsv = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2HSV)
+        # A lightweight colour prior is deliberately bounded so it cannot turn
+        # a low-confidence colour coincidence into a positive detection.
+        def color_weight(candidate: Candidate) -> float:
+            x1, y1, x2, y2 = [int(round(value)) for value in candidate.bbox]
+            crop = hsv[max(0, y1):min(hsv.shape[0], max(y1 + 1, y2)), max(0, x1):min(hsv.shape[1], max(x1 + 1, x2))]
+            if not crop.size:
+                return candidate.score
+            if color_hint == "red":
+                evidence = (((crop[:, :, 0] <= 10) | (crop[:, :, 0] >= 170)) & (crop[:, :, 1] > 65)).mean()
+            elif color_hint == "white":
+                evidence = ((crop[:, :, 1] < 55) & (crop[:, :, 2] > 150)).mean()
+            else:
+                evidence = 0.0
+            return candidate.score * (1.0 + min(0.12, float(evidence) * 0.12))
+        candidates.sort(key=color_weight, reverse=True)
+    else:
+        candidates.sort(key=lambda item: item.score, reverse=True)
+    return (
+        np.asarray([item.bbox for item in candidates], dtype=np.float32),
+        np.asarray([item.score for item in candidates], dtype=np.float32),
+        [item.label for item in candidates],
+    )
 
 
 class OpenVINOCompatibleManager:
@@ -1156,6 +1343,7 @@ class OpenVINOCompatibleManager:
         )
         self.cpu_fallback: PyTorchModelManager | None = None
         self._fallback_lock = threading.Lock()
+        self.last_diagnostics: dict[str, Any] = {"raw_candidates": [], "timings_ms": {}}
 
     @property
     def ready(self) -> bool:
@@ -1167,12 +1355,26 @@ class OpenVINOCompatibleManager:
     def status(self) -> dict[str, Any]:
         return self.engine.status()
 
+    def segment_box(self, image_rgb: np.ndarray, bbox: list[float]) -> np.ndarray:
+        """Route an explicit box to SAM2 without rerunning GroundingDINO."""
+        resized, scale_x, scale_y = resize_for_inference(image_rgb)
+        box = np.asarray([[bbox[0] * scale_x, bbox[1] * scale_y, bbox[2] * scale_x, bbox[3] * scale_y]], dtype=np.float32)
+        masks = self.engine.segment_boxes(resized, box)
+        if not masks:
+            raise RuntimeError("SAM2 未返回用户选中框的掩码")
+        mask = masks[0]
+        if mask.shape != image_rgb.shape[:2]:
+            mask = cv2.resize(mask.astype(np.uint8), (image_rgb.shape[1], image_rgb.shape[0]), interpolation=cv2.INTER_NEAREST)
+        return (mask > 0).astype(np.uint8)
+
     def analyze(
         self,
         image_rgb: np.ndarray,
         prompt: str | tuple[str, ...],
         referring_label: str | None = None,
         color_hint: str | None = None,
+        run_mode: Literal["fast", "full"] = "fast",
+        lightweight: bool = False,
     ) -> list[DetectedObject]:
         resized_rgb, scale_x, scale_y = resize_for_inference(image_rgb)
         engine_prompt = prompt
@@ -1184,19 +1386,40 @@ class OpenVINOCompatibleManager:
         if isinstance(prompt, tuple) and prompt == UNIVERSAL_PROMPT_GROUPS:
             # 独立处理短词组，避免长类别列表超过 256 token 后截断后半部。
             engine_prompt = tuple(prompt[:MAX_UNIVERSAL_PROMPT_GROUPS])
+        use_staged_recall = ENABLE_STAGED_RECALL and not lightweight and isinstance(engine_prompt, tuple)
         try:
-            raw_objects = self.engine.analyze(resized_rgb, engine_prompt, referring_label, color_hint)
+            raw_objects = self.engine.analyze(
+                resized_rgb,
+                engine_prompt,
+                referring_label,
+                color_hint,
+                staged_recall=use_staged_recall,
+                full_mode=run_mode == "full",
+                enable_tiles=ENABLE_TILE_RECALL,
+            )
+            self.last_diagnostics = dict(self.engine.last_diagnostics)
+            # // 优化：可调试性 - raw_candidates 对外统一使用原图坐标。
+            mapped_candidates: list[dict[str, Any]] = []
+            for candidate in self.last_diagnostics.get("raw_candidates", []):
+                copied = dict(candidate)
+                bbox = copied.get("bbox", [])
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    copied["bbox"] = [float(bbox[0]) / scale_x, float(bbox[1]) / scale_y, float(bbox[2]) / scale_x, float(bbox[3]) / scale_y]
+                mapped_candidates.append(copied)
+            self.last_diagnostics["raw_candidates"] = mapped_candidates
         except RuntimeError as exc:
             if "logits saturated" not in str(exc):
                 raise
             logger.warning("OpenVINO 检测 IR 输出饱和，自动切换 PyTorch CPU 推理：%s", exc)
             raw_objects = self._fallback_analyze(resized_rgb, prompt, referring_label, color_hint)
+            self.last_diagnostics = {"raw_candidates": [], "timings_ms": {"dino_detection": 0.0, "nms_postprocess": 0.0, "sam2_segmentation": 0.0}, "fallback": "pytorch"}
         # A stale FP16 IR can produce finite-but-useless logits and an empty
         # list without raising. Retry once through the known-good CPU path so
         # a successful HTTP response never masquerades as a broken analysis.
         if not raw_objects:
             logger.warning("OpenVINO 未返回目标，自动使用 PyTorch CPU 路径重试。")
             raw_objects = self._fallback_analyze(resized_rgb, prompt, referring_label, color_hint)
+            self.last_diagnostics = {"raw_candidates": self.last_diagnostics.get("raw_candidates", []), "timings_ms": self.last_diagnostics.get("timings_ms", {}), "fallback": "pytorch"}
         original_height, original_width = image_rgb.shape[:2]
         restored: list[DetectedObject] = []
         posed_people = 0
@@ -1291,11 +1514,44 @@ class OpenVINOCompatibleManager:
 # False 时严格走原有 PyTorch CPU 路径；不会删除或覆盖旧模型代码。
 model_manager: Any = OpenVINOCompatibleManager() if USE_OPENVINO else PyTorchModelManager()
 capability_enricher = FullCapabilityEnricher(MODEL_DIR)
+# // 优化：异步流水线 - OCR 与检测并行，Caption 使用独立单消费者队列避免拖慢首个响应。
+OCR_EXECUTOR = ThreadPoolExecutor(max_workers=max(1, int(os.getenv("OCR_WORKERS", "1"))), thread_name_prefix="ocr-worker")
+CAPTION_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="caption-worker")
+caption_tasks: dict[str, dict[str, str]] = {}
+caption_tasks_lock = threading.Lock()
+
+
+def parse_bbox(raw_bbox: str, image: np.ndarray) -> list[float]:
+    try:
+        values = json.loads(raw_bbox)
+        if not isinstance(values, list) or len(values) != 4:
+            raise ValueError("bbox 必须为四个数值")
+        x1, y1, x2, y2 = (float(value) for value in values)
+        if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+            raise ValueError("bbox 必须为有限数值")
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="bbox 必须是 JSON 数组 [x1, y1, x2, y2]。") from exc
+    height, width = image.shape[:2]
+    x1, x2 = max(0.0, min(x1, width - 1.0)), max(1.0, min(x2, float(width)))
+    y1, y2 = max(0.0, min(y1, height - 1.0)), max(1.0, min(y2, float(height)))
+    if x2 <= x1 or y2 <= y1:
+        raise HTTPException(status_code=422, detail="bbox 必须在图像范围内且右下角大于左上角。")
+    return [x1, y1, x2, y2]
+
+
+def resolve_ocr(future: Future[list[tuple[str, tuple[float, float, float, float]]]]) -> list[tuple[str, tuple[float, float, float, float]]]:
+    try:
+        return future.result()
+    except Exception as exc:  # pragma: no cover - optional OCR runtime
+        capability_enricher._ocr_error = str(exc)
+        logger.warning("并行 OCR 失败，将返回检测结果：%s", exc)
+        return []
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     logger.info("启动本地视觉模型服务，模型目录：%s", MODEL_DIR)
+    tracemalloc.start()
     model_manager.start_background_load()
     yield
 
@@ -1333,11 +1589,84 @@ def health() -> dict[str, Any]:
     return state
 
 
+@app.post("/api/segment-region", response_model=SegmentResponse)
+def segment_region(media: UploadFile = File(...), bbox: str = Form(...)) -> SegmentResponse:
+    """Generate a SAM2 mask for one explicitly selected image box."""
+    if not model_manager.ready:
+        raise HTTPException(status_code=503, detail="本地模型尚未准备完成。")
+    suffix = Path(media.filename or "").suffix.lower()
+    if (media.content_type or "").startswith("video/") or suffix in ALLOWED_VIDEO_SUFFIXES:
+        raise HTTPException(status_code=415, detail="按需分割当前仅支持图片；视频请先选择关键帧导出为图片。")
+    try:
+        image = decode_image(media.file.read())
+        requested_box = parse_bbox(bbox, image)
+        started = time.perf_counter()
+        mask = model_manager.segment_box(image, requested_box)
+        mask_rle, mask_size = encode_mask_rle(mask)
+        logger.info("用户选框 SAM2 分割完成，耗时 %.1f ms。", (time.perf_counter() - started) * 1000)
+        return SegmentResponse(bbox=[round(value, 2) for value in requested_box], mask_rle=mask_rle, mask_size=mask_size)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("用户选框分割失败：%s", exc)
+        raise HTTPException(status_code=500, detail=f"SAM2 分割失败：{exc}") from exc
+    finally:
+        media.file.close()
+
+
+@app.post("/api/caption-tasks", response_model=CaptionTaskResponse)
+def create_caption_task(media: UploadFile = File(...), bbox: str = Form(...)) -> CaptionTaskResponse:
+    """Queue one selected object caption; never blocks detection responses."""
+    if capability_enricher._caption_ir_dir() is None:
+        return CaptionTaskResponse(task_id="", status="unavailable", error="Moondream2 OpenVINO Stateful IR 尚未导出，Caption 暂不可用。")
+    suffix = Path(media.filename or "").suffix.lower()
+    if (media.content_type or "").startswith("video/") or suffix in ALLOWED_VIDEO_SUFFIXES:
+        raise HTTPException(status_code=415, detail="按需 Caption 当前仅支持图片。")
+    try:
+        image = decode_image(media.file.read())
+        x1, y1, x2, y2 = (int(value) for value in parse_bbox(bbox, image))
+        crop = image[y1:y2, x1:x2].copy()
+        if not crop.size:
+            raise HTTPException(status_code=422, detail="选中区域为空，无法生成描述。")
+        task_id = str(uuid.uuid4())
+        with caption_tasks_lock:
+            caption_tasks[task_id] = {"status": "queued", "caption": "", "error": ""}
+
+        def run_caption() -> None:
+            with caption_tasks_lock:
+                caption_tasks[task_id]["status"] = "running"
+            try:
+                caption = capability_enricher.caption(crop)
+                if not caption:
+                    raise RuntimeError(capability_enricher._caption_error or "Caption 引擎未返回描述")
+                with caption_tasks_lock:
+                    caption_tasks[task_id] = {"status": "completed", "caption": caption, "error": ""}
+            except Exception as exc:  # pragma: no cover - VLM optional runtime
+                logger.warning("Caption 异步任务失败：%s", exc)
+                with caption_tasks_lock:
+                    caption_tasks[task_id] = {"status": "failed", "caption": "", "error": str(exc)}
+
+        CAPTION_EXECUTOR.submit(run_caption)
+        return CaptionTaskResponse(task_id=task_id, status="queued")
+    finally:
+        media.file.close()
+
+
+@app.get("/api/caption-tasks/{task_id}", response_model=CaptionTaskResponse)
+def get_caption_task(task_id: str) -> CaptionTaskResponse:
+    with caption_tasks_lock:
+        task = caption_tasks.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Caption 任务不存在或已过期。")
+    return CaptionTaskResponse(task_id=task_id, status=task["status"], caption=task["caption"], error=task["error"])
+
+
 @app.post("/api/analyze-media", response_model=AnalyzeResponse)
 def analyze_media(
     media: UploadFile = File(...),
     text_prompt: str = Form(""),
     prompt_mode: Literal["universal", "text", "referring"] = Form("text"),
+    run_mode: Literal["fast", "full"] = Form(DEFAULT_RUN_MODE),
 ) -> AnalyzeResponse:
     if not model_manager.ready:
         state = model_manager.status()
@@ -1358,6 +1687,9 @@ def analyze_media(
     if not supported:
         raise HTTPException(status_code=415, detail="仅支持常见图片或视频文件。")
 
+    started_at = time.perf_counter()
+    cpu_started = time.process_time()
+    _, memory_before = tracemalloc.get_traced_memory()
     try:
         normalized_prompt, referring_label = prepare_prompt(prompt_mode, text_prompt)
         color_hint = referring_color_hint(text_prompt) if prompt_mode == "referring" else None
@@ -1366,16 +1698,31 @@ def analyze_media(
             samples = decode_video_sample_frames(media, suffix or ".mp4")
             if prompt_mode == "universal":
                 normalized_prompt = VIDEO_UNIVERSAL_PROMPT_GROUPS
-            frames = [
-                VideoFrameAnnotation(timestamp=timestamp, objects=capability_enricher.enrich(image_rgb, model_manager.analyze(image_rgb, normalized_prompt, referring_label, color_hint), object_factory=DetectedObject))
-                for timestamp, image_rgb in samples
-            ]
+            frames = []
+            for timestamp, image_rgb, is_keyframe in samples:
+                # // 优化：流水线并行 - OCR 在 GroundingDINO/SAM2 执行期间处理整图一次。
+                ocr_future = OCR_EXECUTOR.submit(capability_enricher.scan_ocr, image_rgb)
+                # // 优化：视频分级推理 - 场景变化关键帧走完整召回，基础帧关闭阶段补检和切片。
+                detection = model_manager.analyze(
+                    image_rgb, normalized_prompt, referring_label, color_hint, run_mode, lightweight=not is_keyframe,
+                )
+                frames.append(VideoFrameAnnotation(
+                    timestamp=timestamp,
+                    objects=capability_enricher.enrich(image_rgb, detection, object_factory=DetectedObject, ocr_regions=resolve_ocr(ocr_future)),
+                    is_keyframe=is_keyframe,
+                ))
+            link_video_tracks(frames)
             objects = frames[0].objects
             all_objects = [item for frame in frames for item in frame.objects]
             summary_objects = _representative_video_objects(frames)
         else:
+            preprocess_started = time.perf_counter()
             image_rgb = decode_image(media.file.read())
-            objects = capability_enricher.enrich(image_rgb, model_manager.analyze(image_rgb, normalized_prompt, referring_label, color_hint), object_factory=DetectedObject)
+            preprocess_ms = (time.perf_counter() - preprocess_started) * 1000
+            # // 优化：流水线并行 - 不等待检测结束才启动 OCR，避免两条独立模型链路串行。
+            ocr_future = OCR_EXECUTOR.submit(capability_enricher.scan_ocr, image_rgb)
+            detection = model_manager.analyze(image_rgb, normalized_prompt, referring_label, color_hint, run_mode)
+            objects = capability_enricher.enrich(image_rgb, detection, object_factory=DetectedObject, ocr_regions=resolve_ocr(ocr_future))
             frames = []
             all_objects = objects
             summary_objects = objects
@@ -1385,9 +1732,25 @@ def analyze_media(
         activity = infer_activity(summary_objects, media_type)
         feedback = describe_content(summary_objects, media_type)
         compact_frames = [
-            VideoFrameAnnotation(timestamp=frame.timestamp, objects=compact_objects(frame.objects))
+            VideoFrameAnnotation(timestamp=frame.timestamp, objects=compact_objects(frame.objects), is_keyframe=frame.is_keyframe)
             for frame in frames
         ]
+        diagnostics = getattr(model_manager, "last_diagnostics", {})
+        raw_candidates = [RawCandidate(**item) for item in diagnostics.get("raw_candidates", [])[:RAW_CANDIDATE_LIMIT]]
+        timings = dict(diagnostics.get("timings_ms", {}))
+        timings["preprocess"] = round(preprocess_ms if media_type == "image" else 0.0, 2)
+        timings["ocr"] = capability_enricher.last_metrics.get("ocr", 0.0)
+        timings["caption"] = capability_enricher.last_metrics.get("caption", 0.0)
+        timings["total"] = round((time.perf_counter() - started_at) * 1000, 2)
+        _, memory_peak = tracemalloc.get_traced_memory()
+        rss_mb, peak_rss_mb = process_memory_usage_mb()
+        resources = {
+            "cpu_process_ms": round((time.process_time() - cpu_started) * 1000, 2),
+            "memory_peak_mb": round(memory_peak / 1024 / 1024, 2),
+            "memory_delta_mb": round(max(0, memory_peak - memory_before) / 1024 / 1024, 2),
+            "process_rss_mb": rss_mb,
+            "process_peak_rss_mb": peak_rss_mb,
+        }
         return AnalyzeResponse(
             objects=compact_objects(objects),
             labels=labels,
@@ -1399,6 +1762,10 @@ def analyze_media(
             media_type=media_type,
             frames=compact_frames,
             activity=activity,
+            run_mode=run_mode,
+            raw_candidates=raw_candidates,
+            timings_ms=timings,
+            resource_usage=resources,
         )
     except HTTPException:
         raise

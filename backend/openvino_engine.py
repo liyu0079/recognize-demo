@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoProcessor
+from recall_scheduler import Candidate, staged_recall_detect
 
 logger = logging.getLogger("vision-annotator")
 # SAM2 解码器当前逐框运行。街景等场景若同时分割 80 个候选框，时延会从数秒
@@ -46,6 +47,7 @@ class OpenVINOModelManager:
         post_filter: Callable[[np.ndarray, np.ndarray, list[str], np.ndarray, str | None], tuple[np.ndarray, np.ndarray, list[str]]],
     ) -> None:
         self.model_dir = model_dir / "openvino"
+        self.cache_dir = Path(os.getenv("OPENVINO_CACHE_DIR", str(self.model_dir / ".cache"))).resolve()
         self.grounding_dir = grounding_dir
         self.max_idle_seconds = max_idle_seconds
         self.box_threshold = box_threshold
@@ -60,7 +62,9 @@ class OpenVINOModelManager:
         self.load_error: str | None = None
         self.loading = False
         self._lock = threading.RLock()
-        self._inference_lock = threading.Lock()
+        # // 优化：分层调度 - 姿态/手部补充会复用同一引擎，使用可重入锁避免嵌套调用死锁。
+        self._inference_lock = threading.RLock()
+        self.last_diagnostics: dict[str, Any] = {"raw_candidates": [], "timings_ms": {}}
 
     @property
     def ready(self) -> bool:
@@ -91,12 +95,20 @@ class OpenVINOModelManager:
             from openvino import Core
 
             self.core = Core()
+            # // 优化：OpenVINO 预热与缓存 - 编译缓存跨进程复用，降低首帧加载开销。
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.core.set_property({"CACHE_DIR": str(self.cache_dir)})
+            except Exception as exc:  # pragma: no cover - depends on OpenVINO plugin build
+                logger.warning("OpenVINO 编译缓存不可用，将继续按需编译：%s", exc)
             self.processor = AutoProcessor.from_pretrained(self.grounding_dir, local_files_only=True)
             missing = [name for name in ("grounding_dino", "sam2_encoder", "sam2_prompt", "sam2_decoder") if not self._ir_exists(name)]
             if missing:
                 raise RuntimeError("缺少 OpenVINO IR：" + ", ".join(missing) + "；请先运行 export_all_models.py")
             logger.info("OpenVINO 已就绪，首选设备：%s；模型将在首次推理时加载。", self._device())
             self.load_error = None
+            if os.getenv("OPENVINO_WARMUP", "1") not in {"0", "false", "False"}:
+                threading.Thread(target=self._warmup, name="openvino-warmup", daemon=True).start()
         except Exception as exc:
             self.load_error = str(exc)
             self.core = None
@@ -109,6 +121,15 @@ class OpenVINOModelManager:
         if self.ready or self.loading:
             return
         threading.Thread(target=self.load, name="openvino-loader", daemon=True).start()
+
+    def _warmup(self) -> None:
+        """Compile the request-critical graphs without generating fake detections."""
+        try:
+            for name in ("grounding_dino", "sam2_encoder", "sam2_prompt", "sam2_decoder"):
+                self._compiled(name)
+            logger.info("OpenVINO 请求关键图预热完成。")
+        except Exception as exc:  # pragma: no cover - device-specific optional optimization
+            logger.warning("OpenVINO 预热未完成，首帧会按需编译：%s", exc)
 
     def status(self) -> dict[str, Any]:
         status = "ready" if self.ready else "loading" if self.loading else "model_error" if self.load_error else "not_loaded"
@@ -324,6 +345,22 @@ class OpenVINOModelManager:
         with self._inference_lock:
             return self._pose(image, box)
 
+    def segment_boxes(self, image: np.ndarray, boxes: np.ndarray) -> list[np.ndarray]:
+        """Segment explicitly requested boxes without running detection again."""
+        if not self.ready:
+            raise RuntimeError(self.load_error or "OpenVINO 模型尚未准备完成")
+        # // 优化：按需分割 - 用户选框复用 SAM2，不提高批量检测的默认分割上限。
+        with self._inference_lock:
+            return self._segment(image, boxes)
+
+    def segment_boxes(self, image: np.ndarray, boxes: np.ndarray) -> list[np.ndarray]:
+        """Segment explicitly requested boxes without running detection again."""
+        if not self.ready:
+            raise RuntimeError(self.load_error or "OpenVINO 模型尚未准备完成")
+        # // 优化：按需分割 - 用户选框复用 SAM2，不提高批量检测的默认分割上限。
+        with self._inference_lock:
+            return self._segment(image, boxes)
+
     def estimate_hand_pose(self, image: np.ndarray, box: np.ndarray) -> list[dict[str, float]]:
         """Decode an optional RTMPose-hand SimCC IR; absent IR returns no points."""
         if not self.ready or not self._ir_exists("rtmpose_hand"):
@@ -342,23 +379,44 @@ class OpenVINOModelManager:
         scores = np.minimum(np.max(simcc_x, axis=-1).reshape(-1), np.max(simcc_y, axis=-1).reshape(-1))
         return [{"x": round(float(x1 + x * (x2 - x1) / 192), 2), "y": round(float(y1 + y * (y2 - y1) / 256), 2), "score": round(float(score), 4)} for x, y, score in zip(xs[:21], ys[:21], scores[:21])]
 
-    def analyze(self, image: np.ndarray, prompts: str | tuple[str, ...], referring_label: str | None = None, color_hint: str | None = None) -> list[dict[str, Any]]:
+    def analyze(
+        self,
+        image: np.ndarray,
+        prompts: str | tuple[str, ...],
+        referring_label: str | None = None,
+        color_hint: str | None = None,
+        *,
+        staged_recall: bool = False,
+        full_mode: bool = False,
+        enable_tiles: bool = True,
+    ) -> list[dict[str, Any]]:
         if not self.ready:
             raise RuntimeError(self.load_error or "OpenVINO 模型尚未准备完成")
         with self._inference_lock:
-            all_boxes: list[np.ndarray] = []
-            all_scores: list[np.ndarray] = []
-            labels: list[str] = []
-            for prompt in (prompts,) if isinstance(prompts, str) else prompts:
-                boxes, scores, batch_labels = self._detect(image, prompt)
-                all_boxes.append(boxes)
-                all_scores.append(scores)
-                labels.extend(batch_labels)
-            boxes = np.concatenate(all_boxes) if all_boxes else np.empty((0, 4), dtype=np.float32)
-            scores = np.concatenate(all_scores) if all_scores else np.empty((0,), dtype=np.float32)
+            # // 优化：分阶段调度 - 基础检测的实际标签决定细分类补检，不一次加载全词表。
+            detection_started = time.perf_counter()
+            def detect_candidates(source: np.ndarray, prompt: str) -> list[Candidate]:
+                boxes, scores, labels = self._detect(source, prompt)
+                return [Candidate(tuple(float(value) for value in box), float(score), label) for box, score, label in zip(boxes, scores, labels)]
+
+            if staged_recall and isinstance(prompts, tuple):
+                candidates, stage_one = staged_recall_detect(
+                    image, prompts, detect_candidates, full_mode=full_mode, enable_tiles=enable_tiles,
+                )
+            else:
+                candidates = [item for prompt in ((prompts,) if isinstance(prompts, str) else prompts) for item in detect_candidates(image, prompt)]
+                stage_one = candidates
+            detection_ms = (time.perf_counter() - detection_started) * 1000
+            raw_candidates = [item.as_dict() for item in candidates]
+            boxes = np.asarray([item.bbox for item in candidates], dtype=np.float32) if candidates else np.empty((0, 4), dtype=np.float32)
+            scores = np.asarray([item.score for item in candidates], dtype=np.float32) if candidates else np.empty((0,), dtype=np.float32)
+            labels = [item.label for item in candidates]
             if not len(boxes):
+                self.last_diagnostics = {"raw_candidates": raw_candidates, "timings_ms": {"dino_detection": round(detection_ms, 2), "nms_postprocess": 0.0, "sam2_segmentation": 0.0}, "stage_one_count": len(stage_one)}
                 return []
+            post_started = time.perf_counter()
             boxes, scores, labels = self.post_filter(boxes, scores, labels, image, color_hint)
+            post_ms = (time.perf_counter() - post_started) * 1000
             order = np.argsort(scores)[::-1][:MAX_RESPONSE_OBJECTS]
             boxes = boxes[order]
             scores = scores[order]
@@ -370,7 +428,14 @@ class OpenVINOModelManager:
                     "OpenVINO 返回 %d 个检测实例，仅对得分最高的 %d 个执行 SAM2 分割。",
                     len(boxes), segment_count,
                 )
-            masks = self._segment(image, segment_boxes)
+            segmentation_started = time.perf_counter()
+            try:
+                masks = self._segment(image, segment_boxes) if len(segment_boxes) else []
+            except Exception as exc:
+                # // 优化：检测/分割解耦 - SAM2 异常只影响 mask，检测结果照常返回。
+                logger.warning("SAM2 分割失败，将保留检测框并省略掩码：%s", exc)
+                masks = []
+            segmentation_ms = (time.perf_counter() - segmentation_started) * 1000
             objects: list[dict[str, Any]] = []
             posed_people = 0
             for index, (box, score, label) in enumerate(zip(boxes, scores, labels)):
@@ -389,4 +454,14 @@ class OpenVINOModelManager:
                     points = self.estimate_hand_pose(image, box)
                     hand_keypoints = [points] if len(points) == 21 else []
                 objects.append({"label": final_label, "score": round(float(score), 4), "bbox": [round(float(v), 2) for v in box], "mask": mask.tolist() if mask.size else "", "keypoints": keypoints, "hand_keypoints": hand_keypoints})
+            self.last_diagnostics = {
+                "raw_candidates": raw_candidates,
+                "timings_ms": {
+                    "dino_detection": round(detection_ms, 2),
+                    "nms_postprocess": round(post_ms, 2),
+                    "sam2_segmentation": round(segmentation_ms, 2),
+                },
+                "stage_one_count": len(stage_one),
+                "final_candidate_count": len(objects),
+            }
             return objects

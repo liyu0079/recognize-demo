@@ -21,6 +21,15 @@ export interface Keypoint {
 }
 
 export type PromptMode = 'universal' | 'text' | 'referring'
+export type RunMode = 'fast' | 'full'
+
+export interface RawCandidate {
+  label: string
+  score: number
+  bbox: [number, number, number, number]
+  stage: number
+  tile_id: string
+}
 
 export interface AnalyzeMediaResponse {
   objects: DetectedObject[]
@@ -32,11 +41,29 @@ export interface AnalyzeMediaResponse {
   media_type: 'image' | 'video'
   frames: VideoFrameAnnotation[]
   activity: string
+  run_mode: RunMode
+  raw_candidates: RawCandidate[]
+  timings_ms: Record<string, number>
+  resource_usage: Record<string, number>
 }
 
 export interface VideoFrameAnnotation {
   timestamp: number
   objects: DetectedObject[]
+  is_keyframe: boolean
+}
+
+export interface SegmentResponse {
+  bbox: [number, number, number, number]
+  mask_rle: string
+  mask_size: [number, number]
+}
+
+export interface CaptionTaskResponse {
+  task_id: string
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'unavailable'
+  caption: string
+  error: string
 }
 
 export type BackendModelStatus = 'ready' | 'loading' | 'model_error' | 'not_loaded'
@@ -90,13 +117,36 @@ export async function analyzeMedia(
   textPrompt: string,
   promptMode: PromptMode,
   signal?: AbortSignal,
+  runMode: RunMode = 'fast',
 ): Promise<AnalyzeMediaResponse> {
   const formData = new FormData()
   formData.append('media', media)
   formData.append('text_prompt', textPrompt)
   formData.append('prompt_mode', promptMode)
+  formData.append('run_mode', runMode)
 
   const response = await modelClient.post<AnalyzeMediaResponse>('/api/analyze-media', formData, { signal })
+  return response.data
+}
+
+export async function segmentRegion(media: File, bbox: readonly number[], signal?: AbortSignal): Promise<SegmentResponse> {
+  const formData = new FormData()
+  formData.append('media', media)
+  formData.append('bbox', JSON.stringify(bbox))
+  const response = await modelClient.post<SegmentResponse>('/api/segment-region', formData, { signal })
+  return response.data
+}
+
+export async function createCaptionTask(media: File, bbox: readonly number[], signal?: AbortSignal): Promise<CaptionTaskResponse> {
+  const formData = new FormData()
+  formData.append('media', media)
+  formData.append('bbox', JSON.stringify(bbox))
+  const response = await modelClient.post<CaptionTaskResponse>('/api/caption-tasks', formData, { signal })
+  return response.data
+}
+
+export async function getCaptionTask(taskId: string, signal?: AbortSignal): Promise<CaptionTaskResponse> {
+  const response = await modelClient.get<CaptionTaskResponse>(`/api/caption-tasks/${taskId}`, { signal })
   return response.data
 }
 
